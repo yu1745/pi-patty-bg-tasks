@@ -5,7 +5,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BackgroundRegistry } from "../state.ts";
 import type { Job } from "../types.ts";
-import { createJobWatchdog, referencedLogPaths } from "../watchdog/index.ts";
+import {
+    createJobWatchdog,
+    isDirectHigh,
+    isHigh,
+    referencedLogPaths,
+    type WatchdogVerdict,
+} from "../watchdog/index.ts";
 import { JEV_SERVICE_REQUEST_EVENT, type JevServiceV1 } from "../watchdog/jev-service.ts";
 
 void describe("semantic stuck watchdog", () => {
@@ -14,6 +20,38 @@ void describe("semantic stuck watchdog", () => {
             referencedLogPaths("until rg READY /tmp/run.log; do cat './relative.txt'; done; tail /var/log/app.out /tmp/run.log; cat /tmp/data.bin"),
             ["/tmp/run.log", "/var/log/app.out"],
         );
+    });
+
+    void it("alerts direct evidence once but keeps scope evidence on the two-sample path", () => {
+        const verdict = (overrides: Partial<WatchdogVerdict> = {}): WatchdogVerdict => ({
+            stuck: 0.9,
+            shouldAlert: 0.9,
+            credibleProgress: 0.1,
+            intentionallyPersistent: 0.1,
+            validFiniteWait: 0.1,
+            evidence: {
+                missedTerminalState: 0.9,
+                unavailableInteractiveInput: 0.02,
+                deadRequiredDependency: 0.03,
+                mistakenNonproductiveScope: 0.02,
+                repeatingNonprogress: 0.05,
+            },
+            likelyCause: "missed_terminal_state",
+            model: "jev-test",
+            ...overrides,
+        });
+        assert.equal(isHigh(verdict()), true);
+        assert.equal(isDirectHigh(verdict()), true);
+        assert.equal(isDirectHigh(verdict({
+            evidence: {
+                missedTerminalState: 0.03,
+                unavailableInteractiveInput: 0.02,
+                deadRequiredDependency: 0.03,
+                mistakenNonproductiveScope: 0.9,
+                repeatingNonprogress: 0.05,
+            },
+        })), false);
+        assert.equal(isHigh(verdict({ credibleProgress: 0.51 })), false, "progress above the stricter suppression gate prevents an alert");
     });
 
     void it("uses direct job PID telemetry, alerts without terminating, and stops on abort", async () => {

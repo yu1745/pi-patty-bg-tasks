@@ -16,7 +16,7 @@
   <img alt="license: MIT" src="https://img.shields.io/badge/license-MIT-blue">
 </p>
 
-**Your agent shouldn't twiddle its thumbs while the build runs.** This is Claude Code's background-task experience, brought to Pi: kick off a long command, and instead of blocking the whole session, it slips into the background while the agent keeps working. Auto-background after 120 seconds, instant background with Ctrl+Shift+B, output capture, stall detection, and a full job manager — all in one extension.
+**Your agent shouldn't twiddle its thumbs while the build runs.** This is Claude Code's background-task experience, brought to Pi: kick off a long command, and instead of blocking the whole session, it slips into the background while the agent keeps working. Auto-background after 60 seconds, instant background with Ctrl+Shift+B, output capture, stall detection, and a full job manager — all in one extension.
 
 ## Install
 
@@ -34,7 +34,7 @@ Needs Pi v0.37+. That's the only requirement — there are **no external depende
 
 ## Why You'll Want This
 
-**Blocked sessions are over.** Dev servers, test suites, builds — anything still chugging after 120 seconds gets quietly moved to the background. The agent gets a heads-up and carries on with the next thing instead of staring at a spinner. Want it gone sooner? Background any command by hand, any time.
+**Blocked sessions are over.** Dev servers, test suites, builds — anything still chugging after 60 seconds gets quietly moved to the background. The agent gets a heads-up and carries on with the next thing instead of staring at a spinner. Want it gone sooner? Background any command by hand, any time.
 
 **It feels like Claude Code, because it's modeled on Claude Code.** The whole background/foreground dance — Ctrl+Shift+B to background, output capture, completion pings, stall detection — is built directly on Claude Code's implementation. Same message format, same terminal-native icons, same "agent never stops moving" flow. If you've got the muscle memory, it's already here.
 
@@ -43,7 +43,7 @@ Needs Pi v0.37+. That's the only requirement — there are **no external depende
 ## Quick Start
 
 ```
-# Agent runs a long command — auto-backgrounds after 120s
+# Agent runs a long command — auto-backgrounds after 60s
 bash({ command: "npm run build" })
 
 # Skip the wait — start it in the background up front
@@ -68,12 +68,12 @@ Hit **Ctrl+Shift+B** whenever commands are running to background them all on the
 
 ### bash (override)
 
-The built-in bash tool, with a survival instinct. Commands run normally — but if one blows past 120 seconds, it silently slides into the background. No decision prompt, no forced turn: the tool result itself (`Command running in background with ID: …`) tells the agent where the output is going.
+The built-in bash tool, with a survival instinct. Commands run normally — but if one blows past 60 seconds, it silently slides into the background. No decision prompt, no forced turn: the tool result itself (`Command running in background with ID: …`) tells the agent where the output is going.
 
 | Parameter | Description |
 |-----------|-------------|
 | `command` | Shell command to run |
-| `timeout` | Custom timeout in seconds (default: 120) |
+| `timeout` | Custom timeout in seconds (default: 60) |
 | `run_in_background` | Start the command in the background immediately, skipping the foreground run and the auto-background timer |
 
 ### bash_bg
@@ -175,16 +175,16 @@ Timing and confidence constants:
 
 | Constant | Value | Purpose |
 |---|---:|---|
-| poll interval | 30 s | Refresh lightweight log/process observations without continuously walking `/proc` |
-| minimum job age | 60 s | Never classify ordinary startup latency |
-| quiet-output gate | 60 s | Automatic Jev calls require at least one minute without log growth, unless repetitive output qualifies |
-| repetitive-output gate | 120 s | Require a repeated normalized tail to persist for two minutes |
-| Jev recheck interval | 60 s | Bound API usage while gathering a genuinely newer sample |
-| consecutive-high requirement | 2 | Automatic alerts need two independent high-confidence evaluations; manual checks need one |
+| poll interval | 15 s | Refresh lightweight log/process observations without continuously walking `/proc` |
+| minimum job age | 30 s | Avoid classifying the earliest startup phase |
+| quiet-output gate | 30 s | Automatic Jev calls require 30 seconds without log growth, unless repetitive output qualifies |
+| repetitive-output gate | 60 s | Require a repeated normalized tail to persist for one minute |
+| Jev recheck interval | 30 s | Gather a meaningfully newer process/log sample |
+| confirmation policy | 1 direct / 2 ambiguous | Missed terminal state, unavailable stdin, or dead dependency at ≥ .85 alerts once; scope/repetition requires two ≥ .70 samples |
 | alert cooldown | 15 min | Prevent repeated reminders for the same still-running job |
 | log tail sent | 8 KB | Supply useful evidence while bounding cost and accidental disclosure |
-| thresholds | blocking evidence ≥ .70; progress/service/finite-wait each ≤ .60 | Calibrated for advisories; two consecutive positives still gate automatic alerts |
-| Jev request deadline | 20 s | A model/API delay must not become another blocked job |
+| thresholds | blocking evidence ≥ .70; direct evidence ≥ .85; progress/service/finite-wait each ≤ .50 | Faster direct alerts with stricter healthy-work suppression |
+| Jev request deadline | 10 s | A model/API delay must not become another blocked job |
 
 Only the command, bounded job-log tail, up to three bounded `.log`/`.out`/`.txt` tails explicitly named by that command, job metadata, and process telemetry are sent to TypeSafe. Whole session transcripts and environment variables are not sent. The historical calibration set included missed terminal markers, dead producers, unavailable stdin and mistaken broad filesystem searches as positives; finite sleeps, compiles, downloads, servers and bounded waits as negatives. See the [calibration record](docs/watchdog-calibration.md).
 
@@ -197,7 +197,7 @@ No magic, just a tidy state machine:
 ```
 Command starts (direct Node.js child_process.spawn)
   → Done in <2s?           Return the result immediately
-  → Still running at 120s? Auto-background → the tool result carries the new task ID
+  → Still running at 60s?  Auto-background → the tool result carries the new task ID
   → You press Ctrl+Shift+B?  Background immediately → agent continues
 
 Background job running
@@ -308,7 +308,7 @@ The big one. The background engine was rewritten from the ground up to match Cla
 
 **Breaking changes**
 - **tmux is gone.** Background jobs now run as direct Node.js `child_process.spawn` processes with file-descriptor output capture. tmux is no longer used or required — nothing left to install.
-- **Default auto-background timeout is now 120s** (was 15s), matching Claude Code. Pass an explicit `timeout` to override.
+- **Historical 1.0.1 behavior:** the default auto-background timeout changed from 15s to 120s for Claude Code parity. This fork now uses 60s; pass an explicit `timeout` to override.
 - Background logs moved from `/tmp/pi-bg-<id>.log` to a dedicated `/tmp/pi-bg/<id>.log` directory.
 
 **Highlights**

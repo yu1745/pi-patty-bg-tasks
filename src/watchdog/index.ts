@@ -11,18 +11,20 @@ import { describeJob } from "../format.ts";
 import { discoverJevService, type JevServiceV1 } from "./jev-service.ts";
 import { sampleProcessGroup, type ProcessGroupSnapshot } from "./proc-sampler.ts";
 
-export const WATCHDOG_POLL_MS = 30_000;
-export const WATCHDOG_MIN_AGE_MS = 60_000;
-export const WATCHDOG_QUIET_MS = 60_000;
-export const WATCHDOG_REPEAT_MS = 120_000;
-export const WATCHDOG_RECHECK_MS = 60_000;
+export const WATCHDOG_POLL_MS = 15_000;
+export const WATCHDOG_MIN_AGE_MS = 30_000;
+export const WATCHDOG_QUIET_MS = 30_000;
+export const WATCHDOG_REPEAT_MS = 60_000;
+export const WATCHDOG_RECHECK_MS = 30_000;
 export const WATCHDOG_ALERT_COOLDOWN_MS = 15 * 60_000;
 export const WATCHDOG_MAX_LOG_BYTES = 8_000;
 export const WATCHDOG_MAX_REFERENCED_FILES = 3;
 export const WATCHDOG_MAX_REFERENCED_FILE_BYTES = 4_000;
 export const WATCHDOG_BLOCK_THRESHOLD = 0.7;
-export const WATCHDOG_SUPPRESSION_THRESHOLD = 0.6;
+export const WATCHDOG_DIRECT_BLOCK_THRESHOLD = 0.85;
+export const WATCHDOG_SUPPRESSION_THRESHOLD = 0.5;
 export const WATCHDOG_REQUIRED_CONSECUTIVE = 2;
+export const WATCHDOG_JEV_TIMEOUT_MS = 10_000;
 
 export interface WatchdogEvidence {
     missedTerminalState: number;
@@ -293,7 +295,7 @@ async function askJev(
             },
         },
     };
-    const response = await service.evaluate({ state, questions }, { timeoutMs: 20_000 });
+    const response = await service.evaluate({ state, questions }, { timeoutMs: WATCHDOG_JEV_TIMEOUT_MS });
     const evidence: WatchdogEvidence = {
         missedTerminalState: probability(response.answers.missed_terminal_state, "missed_terminal_state"),
         unavailableInteractiveInput: probability(response.answers.unavailable_interactive_input, "unavailable_interactive_input"),
@@ -314,11 +316,23 @@ async function askJev(
     };
 }
 
-function isHigh(verdict: WatchdogVerdict): boolean {
+export function isHigh(verdict: WatchdogVerdict): boolean {
     return verdict.stuck >= WATCHDOG_BLOCK_THRESHOLD &&
         verdict.credibleProgress <= WATCHDOG_SUPPRESSION_THRESHOLD &&
         verdict.intentionallyPersistent <= WATCHDOG_SUPPRESSION_THRESHOLD &&
         verdict.validFiniteWait <= WATCHDOG_SUPPRESSION_THRESHOLD;
+}
+
+/** Direct, externally verifiable failures do not benefit from waiting for the
+ * same mostly deterministic model judgment twice. Scope and repetition remain
+ * two-sample decisions because they depend more heavily on user intent. */
+export function isDirectHigh(verdict: WatchdogVerdict): boolean {
+    const directEvidence = Math.max(
+        verdict.evidence.missedTerminalState,
+        verdict.evidence.unavailableInteractiveInput,
+        verdict.evidence.deadRequiredDependency,
+    );
+    return isHigh(verdict) && directEvidence >= WATCHDOG_DIRECT_BLOCK_THRESHOLD;
 }
 
 export function createJobWatchdog(pi: ExtensionAPI, reg: BackgroundRegistry): JobWatchdog {
@@ -422,7 +436,10 @@ export function createJobWatchdog(pi: ExtensionAPI, reg: BackgroundRegistry): Jo
             entry.previousProcess = process;
             entry.consecutiveHigh = isHigh(verdict) ? entry.consecutiveHigh + 1 : 0;
             const cooldownPassed = entry.lastAlertAt === undefined || now - entry.lastAlertAt >= WATCHDOG_ALERT_COOLDOWN_MS;
-            if (((force && isHigh(verdict)) || entry.consecutiveHigh >= WATCHDOG_REQUIRED_CONSECUTIVE) && cooldownPassed) {
+            const shouldEmit = force
+                ? isHigh(verdict)
+                : isDirectHigh(verdict) || entry.consecutiveHigh >= WATCHDOG_REQUIRED_CONSECUTIVE;
+            if (shouldEmit && cooldownPassed) {
                 entry.lastAlertAt = now;
                 const evidenceTail = [
                     log.tail,
