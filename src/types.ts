@@ -83,6 +83,8 @@ export interface Job {
     isBackgrounded: boolean;
     /** Defaults to "shell" when absent. */
     kind?: JobKind;
+    /** True for monitor jobs explicitly declared persistent by the caller. */
+    persistent?: boolean;
     /** Transient teardown hook (follower + ws socket). */
     stop?: () => void;
 }
@@ -99,6 +101,7 @@ export interface ForegroundSlot {
 // --- Event types ---
 export const EVENT = {
     stall: "bg-stall",
+    semanticStall: "bg-semantic-stall",
     taskNotification: "task-notification",
     monitorEvent: "bg-monitor-event",
 } as const;

@@ -7,6 +7,20 @@ import { EVENT, type Job } from "../types.ts";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+async function withTimeout<T>(promise: Promise<T>, timeoutMs = 4_000): Promise<T> {
+    let timer: NodeJS.Timeout | undefined;
+    try {
+        return await Promise.race([
+            promise,
+            new Promise<never>((_resolve, reject) => {
+                timer = setTimeout(() => reject(new Error(`operation did not settle within ${timeoutMs}ms`)), timeoutMs);
+            }),
+        ]);
+    } finally {
+        if (timer) clearTimeout(timer);
+    }
+}
+
 interface ToolDef {
     execute: (
         toolCallId: string,
@@ -80,7 +94,7 @@ void describe("bash tool — Claude Code tool-result strings", () => {
         );
         await sleep(400);
         reg.foreground.get("t2")?.requestPause("manual");
-        const res = await pending;
+        const res = await withTimeout(pending);
         const job = onlyJob(reg);
         spawnedPids.push(job.pid);
         assert.equal(
@@ -91,13 +105,13 @@ void describe("bash tool — Claude Code tool-result strings", () => {
 
     void it("timeout auto-background returns the same generic CC string", async () => {
         const { tool, reg, ctx } = harness();
-        const res = await tool.execute(
+        const res = await withTimeout(tool.execute(
             "t3",
             { command: "tail -f /dev/null", timeout: 1 },
             undefined,
             undefined,
             ctx
-        );
+        ));
         const job = onlyJob(reg);
         spawnedPids.push(job.pid);
         assert.equal(
@@ -106,18 +120,21 @@ void describe("bash tool — Claude Code tool-result strings", () => {
         );
     });
 
-    void it("timeout kill (auto-background not allowed) appends 'Command timed out after Ns' to the log", async () => {
-        const { tool, ctx } = harness();
-        // `sleep` is excluded from auto-backgrounding, and a float duration
-        // slips past the blocked-sleep guard — so this hits the kill path.
-        const res = await tool.execute(
+    void it("an explicit sleep follows the uniform timeout auto-background path", async () => {
+        const { tool, reg, ctx } = harness();
+        const res = await withTimeout(tool.execute(
             "t4",
-            { command: "sleep 1.5", timeout: 1 },
+            { command: "sleep 5", timeout: 1 },
             undefined,
             undefined,
             ctx
+        ));
+        const job = onlyJob(reg);
+        spawnedPids.push(job.pid);
+        assert.equal(
+            res.content[0].text,
+            `Command running in background with ID: ${job.id}. Output is being written to: ${job.logPath}`
         );
-        assert.match(res.content[0].text, /Command timed out after 1s/);
     });
 
     void it("an external signal death is reported as killed ('was stopped'), never completed", async () => {

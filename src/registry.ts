@@ -72,6 +72,7 @@ export function createRunningJob(args: {
     toolCallId: string;
     name?: string;
     kind?: JobKind;
+    persistent?: boolean;
     isBackgrounded?: boolean;
 }): Job {
     return {
@@ -85,6 +86,7 @@ export function createRunningJob(args: {
         toolCallId: args.toolCallId,
         isBackgrounded: args.isBackgrounded ?? true,
         kind: args.kind,
+        persistent: args.persistent,
     };
 }
 

@@ -132,6 +132,7 @@ export function registerMonitorTool(pi: ExtensionAPI, reg: BackgroundRegistry): 
                 logPath,
                 toolCallId: _toolCallId,
                 kind: "monitor",
+                persistent,
             });
             add(reg, job);
 

@@ -27,7 +27,7 @@ pi install npm:pi-patty-bg-tasks
 或者直接从 GitHub 装:
 
 ```
-pi install git:github.com/patty-io/pi-patty-bg-tasks
+pi install git:github.com/yu1745/pi-patty-bg-tasks
 ```
 
 只需 Pi v0.37+,要求仅此一条 —— **零外部依赖**,也**不用 tmux**。后台作业就是普通的 Node.js 子进程,输出直接写进一个文件描述符。没什么要装的,也没什么要盯着的。
@@ -84,7 +84,7 @@ agent_bg({ prompt: "重构 auth 模块" })
 |------|------|
 | `command` | 要运行的 shell 命令 |
 | `name` | 可选的可读作业标签 |
-| `timeout` | 可选超时(秒);超时只杀掉无法自动转后台的命令(如 `sleep`),其余照跑不误 |
+| `timeout` | 调用方可选的截止时间(秒);到期后对所有命令统一终止 |
 | `notify` | 发送完成通知(默认:true) |
 
 ### jobs
@@ -157,6 +157,38 @@ monitor({ ws: { url: "wss://events.example.com/stream" }, description: "部署�
 | `/bg` | 把当前进程转后台(等同 Ctrl+Shift+B) |
 | `/bg-list` | 打开交互式后台作业管理器 |
 | `/bg-version` | 显示已加载扩展的版本/路径,方便排查重载问题 |
+| `/stuck-watchdog status` | 显示被跟踪作业及最近一次 Jev 判定 |
+| `/stuck-watchdog on\|off` | 开关语义检查,不会改变任何作业 |
+| `/stuck-watchdog check <job-id>` | 立即发起一次仅提醒式检查 |
+
+## 语义阻塞看门狗
+
+此 fork 在原有交互提示词检测之外，加入了保守的 TypeSafe Jev 语义判定。它根据真实作业 PID 采样 Linux 进程组与后代进程（`/proc` 状态、等待通道、RSS、累计 CPU 与 CPU 增量），并结合有界日志尾部判断。它**只提醒，绝不自动杀进程或修改作业**。声明为 `persistent` 的 monitor 默认跳过自动检查，但仍可手动 `check`。
+
+安装并启用 [`yu1745/pi-extensions`](https://github.com/yu1745/pi-extensions)，再通过 Pi 凭据流程配置密钥：
+
+```text
+/login typesafe-jev
+```
+
+时间与置信度常量：
+
+| 常量 | 数值 | 含义 |
+|---|---:|---|
+| 轮询间隔 | 30 秒 | 低频刷新日志与进程观测，避免持续扫描 `/proc` |
+| 最小作业年龄 | 60 秒 | 不把正常启动阶段拿去分类 |
+| 静默门槛 | 60 秒 | 除重复输出外，自动调用 Jev 前至少一分钟没有日志增长 |
+| 重复输出门槛 | 120 秒 | 规范化后的重复日志尾需持续两分钟 |
+| Jev 复查间隔 | 60 秒 | 控制 API 用量，并确保下一次有更新的样本 |
+| 连续高置信次数 | 2 次 | 自动提醒需连续两次；手动检查一次即可 |
+| 提醒冷却 | 15 分钟 | 防止同一作业反复刷提醒 |
+| 发送日志尾 | 8 KB | 保留有效证据，同时限制费用与意外泄露 |
+| 阈值 | 阻塞证据 ≥ .70；进展/服务/有限等待各 ≤ .60 | 针对提醒校准；自动提醒仍须连续两次命中 |
+| Jev 请求截止 | 20 秒 | 模型/API 延迟不能反过来造成新阻塞 |
+
+只会发送命令、有界作业日志尾、命令中明确写出的至多三个 `.log`/`.out`/`.txt` 文件的有界尾部、作业元数据和进程遥测；不会发送整段会话或环境变量。历史校准正例包括漏掉终止标记、生产者已死、后台等待 stdin、错误的大范围文件系统搜索；反例包括有限 sleep、编译、下载、服务器与有界等待。详见[校准记录](docs/watchdog-calibration.md)。
+
+普通 `sleep` 现在允许执行。工具仍会建议在更合适时使用条件等待，但不再靠命令文本硬拒绝，而由 Jev 根据运行证据给出语义提醒。
 
 ## 工作原理
 
@@ -170,7 +202,7 @@ monitor({ ws: { url: "wss://events.example.com/stream" }, description: "部署�
 
 后台作业运行中
   → 输出经由文件描述符捕获到 /tmp/pi-bg/<id>.log
-  → 卡顿检测:输出停摆且尾部看起来像交互式提示时,警告代理
+  → 卡顿检测:交互提示词启发式 + 保守的 Jev/进程树看门狗共同提醒代理
   → 超量检测:输出冲破上限时,直接终止作业
   → 完成时:独立的 <task-notification> 在轮次中途送达,附带状态 + 输出路径
 ```
@@ -230,7 +262,7 @@ monitor({ ws: { url: "wss://events.example.com/stream" }, description: "部署�
 ### 1.1.1 —— 对齐修复、防数据丢失、实时进度
 
 - **侧边栏实时进度。** 运行中作业的标签现在显示其**最新输出行**(每秒刷新),而不只是命令——长轮询/构建的进度一目了然(`◉ qdrant: {"indexed":8540629,"status":"grey"} (2m10s)`)。ANSI/控制序列会被剥离,保持组件整洁且无法被转义注入。
-- **不再有滞留的 `sleep` 作业。** 朴素的 `sleep N` 等待(即使是嵌入式的——`cd x; sleep 600; check`、换行分隔、或后台运行)现在在 `bash` 与 `bash_bg` 两侧都会被拦截,并引导到会随工作一起结束的工具:`jobs attach`、`monitor` 工具,或会在就绪时退出的 `until` 循环。真正轮询循环内部的 sleep 绝不会被误拦。
+- **历史说明：** 1.1.1 曾硬编码拦截朴素的 `sleep N`。此 fork 已移除该命令文本策略：有限 sleep 可以执行，只有运行证据显示真实阻塞时，语义看门狗才会给出提醒。
 - **取消行为对齐 Claude Code(已对照 CC 源码验证)。** 按 **Esc** 会杀掉正在运行的前台命令(一次有意的取消),而输入新消息、**Ctrl+Shift+B** 或自动后台超时则改为把它移到后台——正是 CC 的 `user-cancel` 与 `interrupt` 之分。长任务靠超时自动后台 + `run_in_background` 来保护,而不是忽略取消。
 
 ### 1.1.7 —— Ctrl+Shift+B(pi 保留键位修复)

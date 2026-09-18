@@ -25,10 +25,12 @@ import { registerMonitorTool } from "./tools/monitor.ts";
 import { registerShortcuts } from "./shortcuts.ts";
 import { registerCommands } from "./commands.ts";
 import { registerInputHandlers } from "./input.ts";
+import { createJobWatchdog } from "./watchdog/index.ts";
 
 /** Extension entry point. */
 export default function (pi: ExtensionAPI): void {
     const reg = new BackgroundRegistry();
+    reg.watchdog = createJobWatchdog(pi, reg);
 
     // ── Tool registration ─────────────────────────────────────────
     // Use the unwrapped tool *definition* so the override inherits Pi's native
@@ -45,6 +47,38 @@ export default function (pi: ExtensionAPI): void {
     registerShortcuts(pi, reg);
     registerCommands(pi, reg);
     registerInputHandlers(pi, reg);
+    pi.registerCommand("stuck-watchdog", {
+        description: "Inspect or toggle Jev-based semantic stall detection",
+        handler: async (args, ctx) => {
+            const [action = "status", jobId] = args.trim().split(/\s+/, 2);
+            if (action === "on") {
+                reg.watchdog?.setEnabled(true);
+                ctx.ui.notify("Semantic stuck watchdog enabled.", "info");
+                return;
+            }
+            if (action === "off") {
+                reg.watchdog?.setEnabled(false);
+                ctx.ui.notify("Semantic stuck watchdog disabled; no jobs were changed.", "info");
+                return;
+            }
+            if (action === "check") {
+                if (!jobId) {
+                    ctx.ui.notify("Usage: /stuck-watchdog check <job-id>", "warning");
+                    return;
+                }
+                await reg.watchdog?.inspectNow(jobId, ctx);
+                return;
+            }
+            const items = reg.watchdog?.status() ?? [];
+            const lines = items.map((item) =>
+                `${item.jobId} age=${item.ageSeconds}s${item.verdict ? ` stuck=${item.verdict.stuck.toFixed(2)} cause=${item.verdict.likelyCause}` : " unchecked"}`
+            );
+            ctx.ui.notify(
+                `Semantic stuck watchdog is ${reg.watchdog?.isEnabled() ? "on" : "off"}. Tracking ${items.length} job(s).${lines.length ? `\n${lines.join("\n")}` : ""}`,
+                "info",
+            );
+        },
+    });
 
     // ── Message rendering ─────────────────────────────────────────
     // <task-notification> messages render as one colored line: green for
@@ -72,6 +106,9 @@ export default function (pi: ExtensionAPI): void {
     pi.registerMessageRenderer(EVENT.stall, (message, _options, theme) =>
         renderTaskNotification(message, theme)
     );
+    pi.registerMessageRenderer(EVENT.semanticStall, (message, _options, theme) =>
+        renderTaskNotification(message, theme)
+    );
 
     // ── Session start ─────────────────────────────────────────────
     // Claude Code parity: the registry is purely in-memory — no persistence,
@@ -85,6 +122,9 @@ export default function (pi: ExtensionAPI): void {
 
     // ── Session shutdown ──────────────────────────────────────────
     pi.on("session_shutdown", async (_event, _ctx) => {
+        // Stop semantic/process samplers before terminating jobs.
+        reg.watchdog?.dispose();
+
         // Stop the live-duration ticker so the interval doesn't outlive the session.
         stopSidebarTicker(reg);
 

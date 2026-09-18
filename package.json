@@ -15,7 +15,7 @@
     "license": "MIT",
     "repository": {
         "type": "git",
-        "url": "git+https://github.com/patty-io/pi-patty-bg-tasks.git"
+        "url": "git+https://github.com/yu1745/pi-patty-bg-tasks.git"
     },
     "files": [
         "src/",

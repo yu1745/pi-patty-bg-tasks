@@ -27,7 +27,7 @@ pi install npm:pi-patty-bg-tasks
 Or straight from GitHub:
 
 ```
-pi install git:github.com/patty-io/pi-patty-bg-tasks
+pi install git:github.com/yu1745/pi-patty-bg-tasks
 ```
 
 Needs Pi v0.37+. That's the only requirement — there are **no external dependencies** and **no tmux**. Background jobs run as plain Node.js child processes with their output piped straight to a file descriptor. Nothing to install, nothing to babysit.
@@ -84,7 +84,7 @@ When you already know it's a long one. Starts a command in the background immedi
 |-----------|-------------|
 | `command` | Shell command to run |
 | `name` | Optional human-readable label for the job |
-| `timeout` | Optional timeout in seconds; an overrun kills only commands that can't be auto-backgrounded (e.g. `sleep`) — anything else keeps running |
+| `timeout` | Optional caller-selected deadline in seconds; an overrun terminates the command uniformly |
 | `notify` | Send a completion notification (default: true) |
 
 ### jobs
@@ -157,6 +157,38 @@ Prefer slashes? Same powers, different door.
 | `/bg` | Background the current process (same as Ctrl+Shift+B) |
 | `/bg-list` | Open the interactive background task manager |
 | `/bg-version` | Show the loaded extension version/path for reload diagnostics |
+| `/stuck-watchdog status` | Show tracked jobs and the latest Jev verdicts |
+| `/stuck-watchdog on\|off` | Enable or disable semantic checks without changing any jobs |
+| `/stuck-watchdog check <job-id>` | Request an immediate advisory check |
+
+## Semantic stuck watchdog
+
+This fork supplements the existing prompt-tail stall heuristic with a conservative TypeSafe Jev evaluation. It samples the real job PID's Linux process group and descendants (`/proc` state, wait channel, RSS, cumulative CPU and CPU delta), plus bounded recent log output. It is **alert-only**: a semantic verdict can notify the operator and agent, but never kills or mutates the job. Persistent `monitor` jobs are skipped automatically; manual `check` remains available.
+
+Install/enable [`yu1745/pi-extensions`](https://github.com/yu1745/pi-extensions), then configure the key through Pi rather than source code:
+
+```text
+/login typesafe-jev
+```
+
+Timing and confidence constants:
+
+| Constant | Value | Purpose |
+|---|---:|---|
+| poll interval | 30 s | Refresh lightweight log/process observations without continuously walking `/proc` |
+| minimum job age | 60 s | Never classify ordinary startup latency |
+| quiet-output gate | 60 s | Automatic Jev calls require at least one minute without log growth, unless repetitive output qualifies |
+| repetitive-output gate | 120 s | Require a repeated normalized tail to persist for two minutes |
+| Jev recheck interval | 60 s | Bound API usage while gathering a genuinely newer sample |
+| consecutive-high requirement | 2 | Automatic alerts need two independent high-confidence evaluations; manual checks need one |
+| alert cooldown | 15 min | Prevent repeated reminders for the same still-running job |
+| log tail sent | 8 KB | Supply useful evidence while bounding cost and accidental disclosure |
+| thresholds | blocking evidence ≥ .70; progress/service/finite-wait each ≤ .60 | Calibrated for advisories; two consecutive positives still gate automatic alerts |
+| Jev request deadline | 20 s | A model/API delay must not become another blocked job |
+
+Only the command, bounded job-log tail, up to three bounded `.log`/`.out`/`.txt` tails explicitly named by that command, job metadata, and process telemetry are sent to TypeSafe. Whole session transcripts and environment variables are not sent. The historical calibration set included missed terminal markers, dead producers, unavailable stdin and mistaken broad filesystem searches as positives; finite sleeps, compiles, downloads, servers and bounded waits as negatives. See the [calibration record](docs/watchdog-calibration.md).
+
+Plain `sleep` commands are now accepted. The tool still recommends condition-based waits when they better express completion, while Jev judges runtime evidence instead of rejecting command text.
 
 ## How It Works
 
@@ -170,7 +202,7 @@ Command starts (direct Node.js child_process.spawn)
 
 Background job running
   → Output captured to /tmp/pi-bg/<id>.log via file descriptor
-  → Stall detection: if the output goes quiet and the tail looks like an interactive prompt, the agent is warned
+  → Stall detection: prompt-tail heuristic + conservative Jev/process-tree watchdog warn the agent
   → Oversize detection: if the output blows past the limit, the job is killed
   → On completion: an individual <task-notification> lands mid-turn with status + output path
 ```
@@ -250,7 +282,7 @@ A completion notice would fire even after the agent had already learned the job'
 ### 1.1.1 — Parity fixes, no-data-loss, live progress
 
 - **Live progress in the sidebar.** A running job's pill now shows its **latest output line** (refreshed every second), not just the command — so a long poll/build shows progress at a glance (`◉ qdrant: {"indexed":8540629,"status":"grey"} (2m10s)`). ANSI/control sequences are stripped so the widget stays clean and can't be escape-injected.
-- **No more lingering `sleep` jobs.** A naive `sleep N` wait (even embedded — `cd x; sleep 600; check`, newline-separated, or backgrounded) is now blocked in both `bash` and `bash_bg`, with steering to the tool that ends when the work does: `jobs attach`, the `monitor` tool, or an `until` loop. Sleeps inside real polling loops are never flagged.
+- **Historical note:** version 1.1.1 blocked naive `sleep N` commands. This fork removes that command-text policy: finite sleeps are accepted, and the semantic watchdog can issue an advisory only when runtime evidence indicates a real block.
 - **Claude Code parity on cancel (verified against CC source).** Pressing **Esc** kills the running foreground command (a deliberate cancel), while typing a new message, **Ctrl+Shift+B**, or the auto-background timeout move it to the background instead — exactly CC's `user-cancel` vs `interrupt` behavior. Long work is protected by auto-backgrounding at the timeout + `run_in_background`, not by ignoring a cancel.
 
 ### 1.1.7 — Ctrl+Shift+B (pi reserved-keybinding fix)

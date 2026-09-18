@@ -13,6 +13,20 @@ const dir = join(tmpdir(), `pi-bg-monitor-${process.pid}`);
 mkdirSync(dir, { recursive: true });
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+async function withTimeout<T>(promise: Promise<T>, timeoutMs = 5_000): Promise<T> {
+    let timer: NodeJS.Timeout | undefined;
+    try {
+        return await Promise.race([
+            promise,
+            new Promise<never>((_resolve, reject) => {
+                timer = setTimeout(() => reject(new Error(`operation did not settle within ${timeoutMs}ms`)), timeoutMs);
+            }),
+        ]);
+    } finally {
+        if (timer) clearTimeout(timer);
+    }
+}
+
 interface CapturedTool {
     execute: (
         toolCallId: string,
@@ -123,7 +137,7 @@ void describe("monitor — split spawn output", () => {
             logPath,
             errPath,
         });
-        await r.exit;
+        await withTimeout(r.exit);
         assert.match(readFileSync(logPath, "utf-8"), /OUT/);
         assert.doesNotMatch(readFileSync(logPath, "utf-8"), /ERR/);
         assert.match(readFileSync(errPath, "utf-8"), /ERR/);
@@ -173,7 +187,7 @@ void describe("monitor — ws source mapping", () => {
         ws.dispatch("message", { data: "world" });
         ws.dispatch("close", { code: 1000, reason: "" });
 
-        await src.exit;
+        await withTimeout(src.exit);
         const body = readFileSync(logPath, "utf-8");
         assert.match(body, /hello/);
         assert.match(body, /\[binary frame, 7 bytes\]/);

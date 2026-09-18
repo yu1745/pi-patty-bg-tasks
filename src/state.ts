@@ -5,9 +5,11 @@
  */
 
 import type { Job, ForegroundSlot } from "./types.ts";
+import type { JobWatchdog } from "./watchdog/index.ts";
 
 export class BackgroundRegistry {
     jobs = new Map<string, Job>();
+    watchdog: JobWatchdog | undefined;
     foreground = new Map<string, ForegroundSlot>();
 
     /** Per-job AbortController — abort() cancels all monitors/pollers for that job. */

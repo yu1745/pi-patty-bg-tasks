@@ -17,7 +17,7 @@ import {
     createBashToolDefinition,
     type BashToolDetails,
 } from "@earendil-works/pi-coding-agent";
-import { appendFileSync, unlinkSync } from "node:fs";
+import { unlinkSync } from "node:fs";
 import type { BackgroundRegistry } from "../state.ts";
 import {
     DEFAULT_TIMEOUT_MS,
@@ -39,9 +39,6 @@ import {
 } from "../registry.ts";
 import {
     assertJobSlot,
-    detectBlockedSleep,
-    SLEEP_WAIT_GUIDANCE,
-    isAutoBackgroundAllowed,
     isBlankCommand,
     requireExistingCwd,
     startBackgroundJob,
@@ -70,7 +67,7 @@ export function registerBashTool(
         promptGuidelines: [
             "Use bash with run_in_background=true when a command is expected to run for a long time.",
             "run_in_background is for ONE notification (the command exits when done). For per-event streaming (watching logs, polling an API, file changes), use the monitor tool instead.",
-            "Never `sleep N` to wait for something — the job lingers for the full sleep. Wait on a background job with jobs action='attach', watch with the monitor tool, or poll with an `until` loop that exits when ready.",
+            "For waits, prefer jobs action='attach' or a condition-based monitor when those express the real completion condition; explicit finite sleep commands remain allowed.",
             "Check background job status with jobs action='list'.",
             "Read background output with jobs action='output'.",
         ],
@@ -87,11 +84,6 @@ export function registerBashTool(
 
             if (isBlankCommand(p.command)) throw new Error("Command is empty.");
             requireExistingCwd(bashCtx.cwd);
-
-            const sleepMatch = detectBlockedSleep(p.command);
-            if (sleepMatch) {
-                throw new Error(`Blocked: ${sleepMatch}. ${SLEEP_WAIT_GUIDANCE}`);
-            }
 
             assertJobSlot(reg);
 
@@ -212,17 +204,6 @@ async function runForeground(args: {
     const timeoutTimer = setTimeout(() => {
         if (reg.nonInteractive) return;
         if (!reg.foreground.has(toolCallId)) return;
-        if (!isAutoBackgroundAllowed(command)) {
-            // Not eligible for auto-background (e.g. `sleep`) — kill it, but
-            // leave a marker in the log first so the model can tell a timeout
-            // kill apart from a normal failure (Claude Code prepends
-            // "Command timed out after {duration}" to the output).
-            try {
-                appendFileSync(logPath, `Command timed out after ${Math.round(timeoutMs / 1000)}s\n`);
-            } catch { /* best-effort — the kill below still happens */ }
-            killProcessTree(spawned.pid, "SIGTERM");
-            return;
-        }
         requestPause("timeout");
     }, timeoutMs);
     (timeoutTimer as NodeJS.Timeout).unref();
