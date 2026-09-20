@@ -10,6 +10,7 @@ import {
 import { describeJob } from "../format.ts";
 import { discoverJevService, type JevServiceV1 } from "./jev-service.ts";
 import { sampleProcessGroup, type ProcessGroupSnapshot } from "./proc-sampler.ts";
+import { boundJson, createWatchdogTrace, summarizeTail, type WatchdogTrace } from "./trace.ts";
 
 export const WATCHDOG_POLL_MS = 15_000;
 export const WATCHDOG_MIN_AGE_MS = 30_000;
@@ -70,6 +71,8 @@ interface TrackedJob {
     lastCheckedAt?: number;
     checking: boolean;
     consecutiveHigh: number;
+    /** Count of Jev verdicts produced for this job, for the trace's stop record. */
+    verdictCount: number;
     lastAlertAt?: number;
     lastVerdict?: WatchdogVerdict;
 }
@@ -80,6 +83,8 @@ export interface JobWatchdog {
     status(): Array<{ jobId: string; ageSeconds: number; verdict?: WatchdogVerdict }>;
     setEnabled(value: boolean): void;
     isEnabled(): boolean;
+    /** Bounded JSONL trace of sampling, verdicts, and alerts. Undefined when tracing is disabled. */
+    readonly trace?: WatchdogTrace;
     dispose(): void;
 }
 
@@ -195,6 +200,7 @@ async function askJev(
     process: ProcessGroupSnapshot,
     referencedFiles: ReferencedFileObservation[],
     now: number,
+    trace: WatchdogTrace,
 ): Promise<WatchdogVerdict> {
     const job = tracked.job;
     const state = {
@@ -295,6 +301,13 @@ async function askJev(
             },
         },
     };
+    // Record exactly what the model was asked to judge, so a run can be audited
+    // after the fact rather than reconstructed from memory.
+    trace.record("jev_request", {
+        jobId: job.id,
+        questionNames: Object.keys(questions),
+        state: boundJson(state),
+    });
     const response = await service.evaluate({ state, questions }, { timeoutMs: WATCHDOG_JEV_TIMEOUT_MS });
     const evidence: WatchdogEvidence = {
         missedTerminalState: probability(response.answers.missed_terminal_state, "missed_terminal_state"),
@@ -335,11 +348,29 @@ export function isDirectHigh(verdict: WatchdogVerdict): boolean {
     return isHigh(verdict) && directEvidence >= WATCHDOG_DIRECT_BLOCK_THRESHOLD;
 }
 
+/** Administrative shape of a verdict for trace lines: scores only, no evidence text. */
+function verdictTraceFields(verdict: WatchdogVerdict) {
+    return {
+        stuck: Number(verdict.stuck.toFixed(3)),
+        credibleProgress: Number(verdict.credibleProgress.toFixed(3)),
+        intentionallyPersistent: Number(verdict.intentionallyPersistent.toFixed(3)),
+        validFiniteWait: Number(verdict.validFiniteWait.toFixed(3)),
+        likelyCause: verdict.likelyCause,
+        model: verdict.model,
+        evidence: Object.fromEntries(
+            Object.entries(verdict.evidence).map(([key, value]) => [key, Number(value.toFixed(3))]),
+        ),
+    };
+}
+
 export function createJobWatchdog(pi: ExtensionAPI, reg: BackgroundRegistry): JobWatchdog {
     const tracked = new Map<string, TrackedJob>();
+    const trace = createWatchdogTrace();
     let enabled = true;
     let disposed = false;
     let missingServiceNotified = false;
+
+    if (trace.path) trace.record("watchdog_start", { tracePath: trace.path, enabled });
 
     const schedule = (entry: TrackedJob) => {
         if (entry.cancelled || disposed || !enabled) return;
@@ -362,6 +393,15 @@ export function createJobWatchdog(pi: ExtensionAPI, reg: BackgroundRegistry): Jo
             "Advisory only: inspect the command, process tree, and waiting assumption. Do not terminate it solely because of this notice.",
         ].join("\n");
         entry.ctx.ui.notify(summary, "warning");
+        trace.record("alert", {
+            jobId: job.id,
+            pid: job.pid,
+            command: job.command,
+            logPath: job.logPath,
+            summary,
+            ...verdictTraceFields(verdict),
+            evidenceTail: summarizeTail(evidence, 800),
+        });
         pi.sendMessage({
             customType: EVENT.semanticStall,
             content,
@@ -419,10 +459,37 @@ export function createJobWatchdog(pi: ExtensionAPI, reg: BackgroundRegistry): Jo
             const repeating = entry.repeatSince !== undefined && now - entry.repeatSince >= WATCHDOG_REPEAT_MS;
             const due = entry.lastCheckedAt === undefined || now - entry.lastCheckedAt >= WATCHDOG_RECHECK_MS;
             entry.previousProcess ??= process;
-            if (!force && (!oldEnough || (!quiet && !repeating) || !due || entry.job.persistent === true)) return;
+            const skipReason = !force
+                ? (entry.job.persistent === true ? "persistent_job"
+                    : !oldEnough ? "job_too_young"
+                        : (!quiet && !repeating) ? "log_still_growing"
+                            : !due ? "recheck_interval"
+                                : undefined)
+                : undefined;
+            trace.record("poll", {
+                jobId: entry.job.id,
+                pid: entry.job.pid,
+                force,
+                ageSeconds: Math.round((now - entry.job.startTime) / 1_000),
+                logBytes: log.size,
+                logQuietSeconds: Math.round((now - entry.lastLogGrowthAt) / 1_000),
+                repetitiveSeconds: entry.repeatSince ? Math.round((now - entry.repeatSince) / 1_000) : 0,
+                process: {
+                    supported: process.supported,
+                    leaderAlive: process.leaderAlive,
+                    processCount: process.processCount,
+                    states: process.states,
+                    waitChannels: process.waitChannels,
+                    totalRssKb: process.totalRssKb,
+                },
+                gate: skipReason ?? "passed",
+                tail: summarizeTail(log.tail),
+            });
+            if (skipReason) return;
 
             const service = discoverJevService(pi);
             if (!service) {
+                trace.record("no_service", { jobId: entry.job.id, notified: !missingServiceNotified });
                 if (!missingServiceNotified) {
                     missingServiceNotified = true;
                     entry.ctx.ui.notify("Semantic watchdog is waiting for TypeSafe Jev. Install/enable pi-extensions and run /login typesafe-jev.", "warning");
@@ -431,14 +498,28 @@ export function createJobWatchdog(pi: ExtensionAPI, reg: BackgroundRegistry): Jo
             }
             missingServiceNotified = false;
             entry.lastCheckedAt = now;
-            const verdict = await askJev(service, entry, log, process, referencedObservations, now);
+            const startedAt = Date.now();
+            const verdict = await askJev(service, entry, log, process, referencedObservations, now, trace);
             entry.lastVerdict = verdict;
+            entry.verdictCount += 1;
             entry.previousProcess = process;
             entry.consecutiveHigh = isHigh(verdict) ? entry.consecutiveHigh + 1 : 0;
             const cooldownPassed = entry.lastAlertAt === undefined || now - entry.lastAlertAt >= WATCHDOG_ALERT_COOLDOWN_MS;
             const shouldEmit = force
                 ? isHigh(verdict)
                 : isDirectHigh(verdict) || entry.consecutiveHigh >= WATCHDOG_REQUIRED_CONSECUTIVE;
+            trace.record("verdict", {
+                jobId: entry.job.id,
+                pid: entry.job.pid,
+                force,
+                latencyMs: Date.now() - startedAt,
+                isHigh: isHigh(verdict),
+                isDirectHigh: isDirectHigh(verdict),
+                consecutiveHigh: entry.consecutiveHigh,
+                cooldownPassed,
+                shouldEmit,
+                ...verdictTraceFields(verdict),
+            });
             if (shouldEmit && cooldownPassed) {
                 entry.lastAlertAt = now;
                 const evidenceTail = [
@@ -446,9 +527,32 @@ export function createJobWatchdog(pi: ExtensionAPI, reg: BackgroundRegistry): Jo
                     ...referencedObservations.map((file) => `[${file.path}]\n${file.tail}`),
                 ].filter(Boolean).join("\n");
                 alert(entry, verdict, evidenceTail);
+            } else if (shouldEmit && !cooldownPassed) {
+                // Suppressed only to avoid repeating a recent reminder — worth
+                // recording, since a long run may otherwise look silent.
+                trace.record("alert_suppressed", {
+                    jobId: entry.job.id,
+                    reason: "cooldown",
+                    cooldownRemainingSeconds: Math.round(
+                        (WATCHDOG_ALERT_COOLDOWN_MS - (now - (entry.lastAlertAt ?? now))) / 1_000,
+                    ),
+                });
+            } else if (isHigh(verdict)) {
+                trace.record("alert_suppressed", {
+                    jobId: entry.job.id,
+                    reason: "needs_consecutive_samples",
+                    consecutiveHigh: entry.consecutiveHigh,
+                    required: WATCHDOG_REQUIRED_CONSECUTIVE,
+                });
             }
             return verdict;
         } catch (error) {
+            trace.record("error", {
+                jobId: entry.job.id,
+                pid: entry.job.pid,
+                force,
+                message: error instanceof Error ? error.message : String(error),
+            });
             if (force) entry.ctx.ui.notify(`Semantic watchdog check failed for ${entry.job.id}: ${error instanceof Error ? error.message : String(error)}`, "error");
             return undefined;
         } finally {
@@ -471,15 +575,36 @@ export function createJobWatchdog(pi: ExtensionAPI, reg: BackgroundRegistry): Jo
                 referencedFileGrowthAt: new Map(),
                 checking: false,
                 consecutiveHigh: 0,
+                verdictCount: 0,
             };
             tracked.set(job.id, entry);
-            const stop = () => {
+            trace.record("track", {
+                jobId: job.id,
+                pid: job.pid,
+                kind: job.kind ?? "shell",
+                name: job.name ?? null,
+                persistent: job.persistent === true,
+                command: job.command,
+                logPath: job.logPath,
+                alreadyAborted: signal.aborted,
+            });
+            const stop = (reason: string) => {
                 entry.cancelled = true;
                 if (entry.timer) clearTimeout(entry.timer);
                 tracked.delete(job.id);
+                trace.record("stop", {
+                    jobId: job.id,
+                    pid: job.pid,
+                    reason,
+                    status: job.status,
+                    exitCode: job.exitCode ?? null,
+                    ageSeconds: Math.round((Date.now() - job.startTime) / 1_000),
+                    verdictCount: entry.verdictCount,
+                    lastVerdict: entry.lastVerdict ? verdictTraceFields(entry.lastVerdict) : null,
+                });
             };
-            if (signal.aborted) stop();
-            else signal.addEventListener("abort", stop, { once: true });
+            if (signal.aborted) stop("aborted_on_track");
+            else signal.addEventListener("abort", () => stop("aborted"), { once: true });
             schedule(entry);
         },
         async inspectNow(jobId, ctx) {
@@ -506,6 +631,7 @@ export function createJobWatchdog(pi: ExtensionAPI, reg: BackgroundRegistry): Jo
         },
         setEnabled(value) {
             enabled = value;
+            trace.record("set_enabled", { enabled: value, trackedJobs: tracked.size });
             for (const entry of tracked.values()) {
                 if (entry.timer) {
                     clearTimeout(entry.timer);
@@ -515,12 +641,14 @@ export function createJobWatchdog(pi: ExtensionAPI, reg: BackgroundRegistry): Jo
             }
         },
         isEnabled() { return enabled; },
+        trace,
         dispose() {
             disposed = true;
             for (const entry of tracked.values()) {
                 entry.cancelled = true;
                 if (entry.timer) clearTimeout(entry.timer);
             }
+            trace.record("watchdog_dispose", { trackedJobs: tracked.size });
             tracked.clear();
         },
     };

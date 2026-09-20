@@ -157,9 +157,10 @@ Prefer slashes? Same powers, different door.
 | `/bg` | Background the current process (same as Ctrl+Shift+B) |
 | `/bg-list` | Open the interactive background task manager |
 | `/bg-version` | Show the loaded extension version/path for reload diagnostics |
-| `/stuck-watchdog status` | Show tracked jobs and the latest Jev verdicts |
+| `/stuck-watchdog status` | Show tracked jobs, the latest Jev verdicts, and the trace path |
 | `/stuck-watchdog on\|off` | Enable or disable semantic checks without changing any jobs |
 | `/stuck-watchdog check <job-id>` | Request an immediate advisory check |
+| `/stuck-watchdog stats` | Summarize the JSONL trace over its whole window |
 
 ## Semantic stuck watchdog
 
@@ -189,6 +190,39 @@ Timing and confidence constants:
 Only the command, bounded job-log tail, up to three bounded `.log`/`.out`/`.txt` tails explicitly named by that command, job metadata, and process telemetry are sent to TypeSafe. Whole session transcripts and environment variables are not sent. The historical calibration set included missed terminal markers, dead producers, unavailable stdin and mistaken broad filesystem searches as positives; finite sleeps, compiles, downloads, servers and bounded waits as negatives. See the [calibration record](docs/watchdog-calibration.md).
 
 Plain `sleep` commands are now accepted. The tool still recommends condition-based waits when they better express completion, while Jev judges runtime evidence instead of rejecting command text.
+
+### Trace log
+
+The watchdog is advisory and otherwise leaves no durable record: verdicts reach the UI only as transient notifications and the session transcript only as `bg-semantic-stall` messages. To make a long real-work run reviewable afterwards, every decision is also appended as one JSON object per line:
+
+```text
+${PI_CODING_AGENT_DIR:-~/.pi/agent}/watchdog/events.jsonl
+```
+
+| Event | Contents |
+|---|---|
+| `watchdog_start` / `dispose` / `set_enabled` | Extension lifecycle and on/off toggles |
+| `track` / `stop` | Job entered or left tracking, with its last verdict |
+| `poll` | Each sample plus the `gate` that passed it to Jev or suppressed it (`job_too_young`, `log_still_growing`, `recheck_interval`, `persistent_job`) |
+| `jev_request` | The exact bounded state sent to the model |
+| `verdict` | All scores, `likelyCause`, model id, latency, and the alert decision |
+| `alert` / `alert_suppressed` | Advisory emitted, or withheld for cooldown / needing a second sample |
+| `no_service` / `error` | Missing Jev service, or a check that threw |
+
+Records are bounded (log tails and state strings are truncated, arrays capped) and the file rotates to `events.jsonl.1` at 8 MB, so an unattended run cannot grow without limit. Tracing is best-effort and can never block or crash the watchdog; it writes synchronously to avoid interleaving, and directory creation walks one level at a time because `mkdir(..., {recursive: true})` can hang rather than fail on `/proc`.
+
+Inspect a run with `/stuck-watchdog stats` (record counts, poll-gate histogram, verdict and alert cause histograms, suppressed-alert reasons, Jev latency min/mean/p95/max), or read the JSONL directly:
+
+```bash
+# Every alert with its verdict scores
+jq -c 'select(.event=="alert") | {jobId, likelyCause, stuck, credibleProgress}' \
+  ~/.pi/agent/watchdog/events.jsonl
+
+# Why automatic checking skipped a job
+jq -r 'select(.event=="poll") | .gate' ~/.pi/agent/watchdog/events.jsonl | sort | uniq -c
+```
+
+Set `PI_PATTY_WATCHDOG_LOG` to redirect the trace (`0`, `off`, `false`, or `no` disables it). Under the Node test runner tracing stays off unless a path is set explicitly, so a test run cannot contaminate a real session's trace.
 
 ## How It Works
 

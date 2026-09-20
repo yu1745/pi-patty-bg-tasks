@@ -26,6 +26,7 @@ import { registerShortcuts } from "./shortcuts.ts";
 import { registerCommands } from "./commands.ts";
 import { registerInputHandlers } from "./input.ts";
 import { createJobWatchdog } from "./watchdog/index.ts";
+import { formatWatchdogTraceStats, readWatchdogTrace } from "./watchdog/trace-report.ts";
 
 /** Extension entry point. */
 export default function (pi: ExtensionAPI): void {
@@ -69,12 +70,26 @@ export default function (pi: ExtensionAPI): void {
                 await reg.watchdog?.inspectNow(jobId, ctx);
                 return;
             }
+            if (action === "stats" || action === "log") {
+                const tracePath = reg.watchdog?.trace?.path;
+                if (!tracePath) {
+                    ctx.ui.notify("Watchdog tracing is disabled (PI_PATTY_WATCHDOG_LOG=0).", "warning");
+                    return;
+                }
+                const report = await readWatchdogTrace(tracePath);
+                if (!report) {
+                    ctx.ui.notify(`No watchdog trace yet at ${tracePath}.`, "info");
+                    return;
+                }
+                ctx.ui.notify(formatWatchdogTraceStats(report.stats), "info");
+                return;
+            }
             const items = reg.watchdog?.status() ?? [];
             const lines = items.map((item) =>
                 `${item.jobId} age=${item.ageSeconds}s${item.verdict ? ` stuck=${item.verdict.stuck.toFixed(2)} cause=${item.verdict.likelyCause}` : " unchecked"}`
             );
             ctx.ui.notify(
-                `Semantic stuck watchdog is ${reg.watchdog?.isEnabled() ? "on" : "off"}. Tracking ${items.length} job(s).${lines.length ? `\n${lines.join("\n")}` : ""}`,
+                `Semantic stuck watchdog is ${reg.watchdog?.isEnabled() ? "on" : "off"}. Tracking ${items.length} job(s).${lines.length ? `\n${lines.join("\n")}` : ""}\nTrace: ${reg.watchdog?.trace?.path ?? "disabled"} (use /stuck-watchdog stats)`,
                 "info",
             );
         },

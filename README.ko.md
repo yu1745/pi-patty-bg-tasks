@@ -157,9 +157,10 @@ monitor({ ws: { url: "wss://events.example.com/stream" }, description: "배포 �
 | `/bg` | 현재 프로세스를 백그라운드로 (Ctrl+Shift+B와 동일) |
 | `/bg-list` | 인터랙티브 백그라운드 작업 관리자 열기 |
 | `/bg-version` | 로드된 익스텐션 버전/경로 표시 (리로드 진단용) |
-| `/stuck-watchdog status` | 추적 중인 잡과 최근 Jev 판정 표시 |
+| `/stuck-watchdog status` | 추적 중인 잡, 최근 Jev 판정, trace 경로 표시 |
 | `/stuck-watchdog on\|off` | 잡을 변경하지 않고 의미 기반 검사를 켜거나 끄기 |
 | `/stuck-watchdog check <job-id>` | 즉시 알림 전용 검사 실행 |
+| `/stuck-watchdog stats` | 전체 구간의 JSONL trace 요약 |
 
 ## 의미 기반 정체 워치독
 
@@ -187,6 +188,39 @@ monitor({ ws: { url: "wss://events.example.com/stream" }, description: "배포 �
 명령, 제한된 잡 로그 꼬리, 명령에 명시된 최대 세 개의 `.log`/`.out`/`.txt` 파일 꼬리, 잡 메타데이터와 프로세스 텔레메트리만 TypeSafe로 전송합니다. 전체 세션과 환경 변수는 보내지 않습니다. 보정 사례는 놓친 종료 표식, 종료된 생산자, 불가능한 stdin, 잘못된 광범위 파일 검색을 양성으로, 유한 sleep·컴파일·다운로드·서버·유한 폴링을 음성으로 포함합니다. 자세한 내용은 [보정 기록](docs/watchdog-calibration.md)을 참고하세요.
 
 일반 `sleep` 명령도 이제 허용됩니다. 조건 기반 대기가 더 적절할 때는 권장하지만, 명령 문자열을 하드코딩해 거부하지 않고 Jev가 실행 증거를 보고 알림만 판단합니다.
+
+### Trace 로그
+
+워치독은 알림만 보내고 그 자체로는 지속적인 기록을 남기지 않습니다. 판정은 UI의 일시적 알림과 세션 기록의 `bg-semantic-stall` 메시지로만 전달됩니다. 장시간 실제 사용을 사후에 검토할 수 있도록 모든 결정을 JSONL(한 줄에 JSON 객체 하나)로 추가 기록합니다:
+
+```text
+${PI_CODING_AGENT_DIR:-~/.pi/agent}/watchdog/events.jsonl
+```
+
+| 이벤트 | 내용 |
+|---|---|
+| `watchdog_start` / `dispose` / `set_enabled` | 익스텐션 수명주기와 on/off 전환 |
+| `track` / `stop` | 잡이 추적에 들어오거나 나감, 마지막 판정 포함 |
+| `poll` | 각 샘플과, Jev로 보냈는지 억제했는지 나타내는 `gate` (`job_too_young`, `log_still_growing`, `recheck_interval`, `persistent_job`) |
+| `jev_request` | 모델에 실제로 전송된 제한된 state |
+| `verdict` | 모든 점수, `likelyCause`, 모델 id, 지연, 알림 결정 |
+| `alert` / `alert_suppressed` | 알림 발송, 또는 쿨다운/두 번째 샘플 필요로 인한 억제 |
+| `no_service` / `error` | Jev 서비스 없음, 또는 검사 예외 |
+
+기록은 모두 제한적이며(로그 꼬리와 state 문자열은 잘리고 배열은 상한이 있음), 파일이 8MB에 도달하면 `events.jsonl.1`로 회전하므로 무인 장기 실행도 무한히 커지지 않습니다. 쓰기는 best-effort이며 워치독을 절대 차단하거나 중단시키지 않습니다. 인터리빙을 피하려고 동기로 쓰고, 디렉터리 생성은 한 단계씩 수행합니다. `mkdir(..., {recursive: true})`는 `/proc`에서 실패하지 않고 멈출 수 있기 때문입니다.
+
+`/stuck-watchdog stats`로 요약(기록 수, poll gate 히스토그램, 판정·알림 원인 히스토그램, 억제 사유, Jev 지연 min/mean/p95/max)을 보거나 JSONL을 직접 읽으세요:
+
+```bash
+# 모든 알림과 판정 점수
+jq -c 'select(.event=="alert") | {jobId, likelyCause, stuck, credibleProgress}' \
+  ~/.pi/agent/watchdog/events.jsonl
+
+# 자동 검사가 잡을 건너뛴 이유
+jq -r 'select(.event=="poll") | .gate' ~/.pi/agent/watchdog/events.jsonl | sort | uniq -c
+```
+
+`PI_PATTY_WATCHDOG_LOG`로 trace를 리디렉션할 수 있습니다(`0`, `off`, `false`, `no`는 비활성화). Node 테스트 러너에서는 경로를 명시하지 않으면 tracing이 꺼져 있으므로 테스트 실행이 실제 세션의 trace를 오염시키지 않습니다.
 
 ## 동작 원리
 

@@ -157,9 +157,10 @@ monitor({ ws: { url: "wss://events.example.com/stream" }, description: "部署�
 | `/bg` | 把当前进程转后台(等同 Ctrl+Shift+B) |
 | `/bg-list` | 打开交互式后台作业管理器 |
 | `/bg-version` | 显示已加载扩展的版本/路径,方便排查重载问题 |
-| `/stuck-watchdog status` | 显示被跟踪作业及最近一次 Jev 判定 |
-| `/stuck-watchdog on\|off` | 开关语义检查,不会改变任何作业 |
+| `/stuck-watchdog status` | 显示被跟踪作业、最近一次 Jev 判定与 trace 路径 |
+| `/stuck-watchdog on\|off` | 开关语义检查，不会改变任何作业 |
 | `/stuck-watchdog check <job-id>` | 立即发起一次仅提醒式检查 |
+| `/stuck-watchdog stats` | 汇总整个窗口的 JSONL trace |
 
 ## 语义阻塞看门狗
 
@@ -189,6 +190,39 @@ monitor({ ws: { url: "wss://events.example.com/stream" }, description: "部署�
 只会发送命令、有界作业日志尾、命令中明确写出的至多三个 `.log`/`.out`/`.txt` 文件的有界尾部、作业元数据和进程遥测；不会发送整段会话或环境变量。历史校准正例包括漏掉终止标记、生产者已死、后台等待 stdin、错误的大范围文件系统搜索；反例包括有限 sleep、编译、下载、服务器与有界等待。详见[校准记录](docs/watchdog-calibration.md)。
 
 普通 `sleep` 现在允许执行。工具仍会建议在更合适时使用条件等待，但不再靠命令文本硬拒绝，而由 Jev 根据运行证据给出语义提醒。
+
+### Trace 日志
+
+看门狗只做提醒，本身不留下任何持久记录：判定结果仅以瞬时通知出现在 UI，以及作为 `bg-semantic-stall` 消息写入会话记录。为了让长时间真实使用可以事后复盘，每个决策都会额外以 JSONL（每行一个 JSON 对象）追加写入：
+
+```text
+${PI_CODING_AGENT_DIR:-~/.pi/agent}/watchdog/events.jsonl
+```
+
+| 事件 | 内容 |
+|---|---|
+| `watchdog_start` / `dispose` / `set_enabled` | 扩展生命周期与开关切换 |
+| `track` / `stop` | 作业进入/离开跟踪，并附带最后一次判定 |
+| `poll` | 每次采样，以及让它进入 Jev 或被抑制的 `gate`（`job_too_young`、`log_still_growing`、`recheck_interval`、`persistent_job`） |
+| `jev_request` | 实际发送给模型的有界 state |
+| `verdict` | 全部评分、`likelyCause`、模型 id、延迟与提醒决策 |
+| `alert` / `alert_suppressed` | 已发出提醒，或因冷却/需第二次样本而被抑制 |
+| `no_service` / `error` | Jev 服务缺失，或检查抛错 |
+
+记录均有界（日志尾与 state 字符串会截断、数组有上限），文件达到 8 MB 时轮转为 `events.jsonl.1`，因此无人值守的长跑也不会无限增长。写入是尽力而为、绝不阻塞或压垮看门狗；同步写入以避免交错，创建目录逐级进行，因为 `mkdir(..., {recursive: true})` 在 `/proc` 上可能挂死而非报错。
+
+用 `/stuck-watchdog stats` 查看汇总（记录数、poll gate 直方图、判定与提醒原因直方图、被抑制原因、Jev 延迟 min/mean/p95/max），或直接读取 JSONL：
+
+```bash
+# 查看所有提醒及其判定评分
+jq -c 'select(.event=="alert") | {jobId, likelyCause, stuck, credibleProgress}' \
+  ~/.pi/agent/watchdog/events.jsonl
+
+# 统计自动检查跳过作业的原因
+jq -r 'select(.event=="poll") | .gate' ~/.pi/agent/watchdog/events.jsonl | sort | uniq -c
+```
+
+可用 `PI_PATTY_WATCHDOG_LOG` 重定向 trace（`0`、`off`、`false`、`no` 表示关闭）。在 Node 测试运行器下，除非显式指定路径，否则 trace 默认关闭，因此跑测试不会污染真实会话的 trace。
 
 ## 工作原理
 
