@@ -1,103 +1,89 @@
-/**
- * Line-accurate tail follower for the monitor tool.
- *
- * Unlike output.ts/pollFileTail (a bounded 4 KB tail deduped by content, fine
- * for progress display but lossy under bursts), this follower tracks a byte
- * offset forward from 0 and emits only *complete* newly-appended lines. A
- * partial trailing line is held until its newline arrives. Lines read within a
- * single poll tick are delivered together, so the poll cadence doubles as the
- * batch window.
- *
- * This is the single emitter path for both monitor sources: command monitors
- * append to the log via the child's stdout fd; ws monitors append each frame as
- * a line. The follower does not care which.
- */
-
 import { closeSync, openSync, readSync, statSync } from "node:fs";
+import { StringDecoder } from "node:string_decoder";
+import { monitorCaptureEpoch } from "./monitor-capture.ts";
 import { MONITOR_POLL_MS } from "./types.ts";
 
-export interface MonitorFollower {
-    /** Stop polling. When flush is true, do a final synchronous read and emit
-     *  any remaining complete lines plus a trailing partial line (the process
-     *  ended, so the last unterminated line is final). */
-    stop(flush?: boolean): void;
-}
+// Bounds apply before splitting/joining, including newline-free producers.
+export const MONITOR_READ_BYTES = 16 * 1024;
+export const MONITOR_LINE_CHARS = 4096;
+export const MONITOR_BATCH_LINES = 128;
+const FINAL_READ_LIMIT = 16;
+export interface MonitorFollower { stop(flush?: boolean): void; }
 
-/**
- * Follow `logPath`, invoking `onLines` with each batch of newly-completed
- * lines. Starts at offset 0. Reads are bounded by available bytes, not file
- * size history, so growth is O(new bytes) per tick.
- */
 export function followLines(
     logPath: string,
     onLines: (lines: string[]) => void,
-    intervalMs: number = MONITOR_POLL_MS
+    intervalMs = MONITOR_POLL_MS,
+    onError: (error: unknown) => void = (error) => console.error("[monitor follower]", error),
 ): MonitorFollower {
+    const epoch = monitorCaptureEpoch(logPath);
+    let generation = epoch?.generation;
     let offset = 0;
     let remainder = "";
+    let truncated = false;
     let stopped = false;
-
-    /** Read everything appended since `offset`, split into complete lines.
-     *  Returns complete lines; updates offset and remainder. */
-    function readNew(): string[] {
-        let size: number;
-        try {
-            size = statSync(logPath).size;
-        } catch {
-            return []; // file not created yet
+    let decoder = new StringDecoder("utf8");
+    const buffer = Buffer.allocUnsafe(MONITOR_READ_BYTES);
+    const deliver = (lines: string[]) => {
+        if (!lines.length) return;
+        try { onLines(lines); } catch (error) { onError(error); }
+    };
+    function consume(text: string): void {
+        let lines: string[] = [];
+        for (const part of text.split(/(?<=\n)/)) {
+            const complete = part.endsWith("\n");
+            const body = complete ? part.slice(0, -1) : part;
+            const room = MONITOR_LINE_CHARS - remainder.length;
+            remainder += body.slice(0, room);
+            if (body.length > room) truncated = true;
+            if (complete) {
+                lines.push(remainder + (truncated ? " [line truncated]" : ""));
+                remainder = "";
+                truncated = false;
+                if (lines.length === MONITOR_BATCH_LINES) { deliver(lines); lines = []; }
+            }
         }
-        // Truncation/rotation: the file shrank below our offset. Reset so we
-        // don't go permanently silent reading past the new end.
-        if (size < offset) {
-            offset = 0;
-            remainder = "";
-        }
-        if (size <= offset) return [];
-
-        const toRead = size - offset;
-        // allocUnsafe is safe here: only the [0, n) slice that readSync fills is
-        // ever consumed below.
-        const buf = Buffer.allocUnsafe(toRead);
-        let fd: number;
-        try {
-            fd = openSync(logPath, "r");
-        } catch {
-            return [];
-        }
-        try {
-            const n = readSync(fd, buf, 0, toRead, offset);
-            offset += n;
-            const text = remainder + buf.toString("utf-8", 0, n);
-            const parts = text.split("\n");
-            remainder = parts.pop() ?? ""; // trailing partial (no newline yet)
-            return parts;
-        } finally {
-            closeSync(fd);
-        }
+        deliver(lines);
     }
-
+    function readNew(): boolean {
+        let fd: number | undefined;
+        try {
+            let size: number;
+            try { size = statSync(logPath).size; } catch (error) {
+                if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+                throw error;
+            }
+            if (size < offset || epoch?.generation !== generation) {
+                offset = 0; remainder = ""; truncated = false; decoder = new StringDecoder("utf8");
+                generation = epoch?.generation;
+                deliver(["[monitor retained output rotated; older events may be omitted]"]);
+            }
+            if (size <= offset) return false;
+            fd = openSync(logPath, "r");
+            const n = readSync(fd, buffer, 0, Math.min(size - offset, buffer.length), offset);
+            offset += n;
+            consume(decoder.write(buffer.subarray(0, n)));
+            return offset < size;
+        } catch (error) { onError(error); return false; }
+        finally { if (fd !== undefined) { try { closeSync(fd); } catch (error) { onError(error); } } }
+    }
     const timer = setTimeout(function tick() {
         if (stopped) return;
-        const lines = readNew();
-        if (lines.length > 0) onLines(lines);
+        readNew();
         if (!stopped) timer.refresh();
     }, intervalMs);
-    (timer as NodeJS.Timeout).unref();
-
+    timer.unref();
     return {
         stop(flush = false) {
             if (stopped) return;
             stopped = true;
             clearTimeout(timer);
-            if (flush) {
-                const lines = readNew();
-                // A non-empty remainder is a final, newline-less last line.
-                if (remainder.length > 0) {
-                    lines.push(remainder);
-                    remainder = "";
-                }
-                if (lines.length > 0) onLines(lines);
-            }
+            if (!flush) return;
+            let more = false;
+            for (let i = 0; i < FINAL_READ_LIMIT; i++) { more = readNew(); if (!more) break; }
+            if (more) { deliver(["[monitor final backlog omitted: flush limit reached]"]); remainder = ""; }
+            else { consume(decoder.end()); if (remainder) deliver([remainder + (truncated ? " [line truncated]" : "")]); }
+            remainder = "";
         },
     };
 }

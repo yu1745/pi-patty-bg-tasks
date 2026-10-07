@@ -2,7 +2,7 @@
  * Type definitions and shared constants for the background-tasks extension.
  */
 
-import type { ChildProcess } from "node:child_process";
+import type { ProcessIdentity } from "./spawn.ts";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 
 // --- Configuration constants ---
@@ -67,16 +67,17 @@ export interface Job {
     name?: string;
     command: string;
     pid: number;
+    /** Present for every production spawned job; PID alone is display metadata. */
+    identity?: ProcessIdentity;
     startTime: number;
     status: JobStatus;
     exitCode?: number;
     logPath: string;
-    proc?: ChildProcess;
     toolCallId: string;
     donePromise?: Promise<void>;
     resolveDone?: () => void;
     /** Exactly-once latch for the terminal <task-notification> (Claude Code's
-     *  `notified` flag). Set BEFORE the notification send, before a deliberate
+     *  `notified` flag). Set AFTER successful notification delivery, before a deliberate
      *  kill, and when the agent reads the outcome via jobs output/attach — any
      *  path that already surfaced the result suppresses the notification. */
     notified?: boolean;

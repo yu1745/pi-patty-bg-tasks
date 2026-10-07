@@ -18,6 +18,15 @@
 
 **Your agent shouldn't twiddle its thumbs while the build runs.** This is Claude Code's background-task experience, brought to Pi: kick off a long command, and instead of blocking the whole session, it slips into the background while the agent keeps working. Auto-background after 60 seconds, instant background with Ctrl+Shift+B, output capture, stall detection, and a full job manager — all in one extension.
 
+## Current v2 configuration and lifecycle
+
+- Set `PI_PATTY_DISABLE_AGENT_BG=1` (also `true` or `yes`) before startup to omit `agent_bg`. Default remains enabled. If another subagent extension is installed, opt out to avoid overlapping delegation tools; bash, jobs, and monitors remain enabled.
+- Logs and continuity prompts use an owner-private random `pi-patty-bg-*` directory under Node's temporary directory (honoring `TMPDIR`). Use returned paths rather than `/tmp/pi-bg`.
+- `job_decide` is **not** a v2 tool. Historical release notes describe v1 only; use `jobs` for management.
+- Ordinary jobs have a sampled 100 MiB output cap (foreground checks every 200 ms, background checks every 5 s); fast producers can overshoot. Monitors retain at most 1 MiB per stdout/stderr capture, rotate old output, limit frames to 64 KiB and displayed lines to 4096 characters. Persistent monitors remove the deadline, not these bounds.
+- `jobs cleanup`, terminal-ring eviction, and orderly shutdown delete retained stdout/stderr captures. Hard-crash logs and empty private directories are left to the OS temporary-file policy.
+- See [issue remediation](docs/issue-remediation.md) for verification and limitations.
+
 ## Install
 
 ```
@@ -235,24 +244,25 @@ Command starts (direct Node.js child_process.spawn)
   → You press Ctrl+Shift+B?  Background immediately → agent continues
 
 Background job running
-  → Output captured to /tmp/pi-bg/<id>.log via file descriptor
+  → Output captured to <tempdir>/pi-patty-bg-<random>/<id>.log via file descriptor
   → Stall detection: prompt-tail heuristic + conservative Jev/process-tree watchdog warn the agent
   → Oversize detection: if the output blows past the limit, the job is killed
   → On completion: an individual <task-notification> lands mid-turn with status + output path
 ```
 
-Background jobs run as detached Node.js child processes with their stdout/stderr wired
-straight to a log file descriptor — the exact pattern Claude Code uses. No tmux, no
-external process manager, nothing standing between your command and its log. Up to
-**16 background jobs** run at once; ask for a 17th and it's politely rejected until a
-slot frees up. The registry is purely in-memory: a session shutdown — any shutdown,
-not just quit — kills every running task, and nothing is revived into the next
-session. Log files in `/tmp/pi-bg` are simply left for the OS to clean.
+Shell/agent jobs write directly to file descriptors. Command monitors use bounded
+pipe capture so rolling retention can keep persistent watches alive without unlimited
+disk growth. On POSIX, a small Node supervisor anchors each process group and watches
+an IPC pipe for parent death; no tmux or external manager is required. Up to **16
+background jobs** run at once. Every orderly session shutdown attempts bounded
+TERM→KILL cleanup and removes terminal captures; nothing is revived into the next
+session. Descendants deliberately escaping their group and hard-crash temp retention
+are documented limitations.
 
 Under the hood, all three task kinds (shell, agent, monitor) live in one unified
 in-memory registry and share a single notification engine. Spawning listens for the
-child's `exit` event rather than `close`, so a daemonized grandchild that inherits
-the output descriptors can't hang a job past its real end. Each finished task sends
+command's result via the supervisor, which cleans ordinary descendants rather than
+waiting for their inherited file descriptors to close. Each finished task sends
 its own `<task-notification>` exactly once — reading a finished job's output with
 `jobs output`/`attach` marks it read and suppresses the pending ping, and
 completed-but-unread jobs show `, unread` in `jobs list` and the sidebar.
@@ -297,7 +307,7 @@ The 1.1.5 fix stopped the *completion* notice from forcing an acknowledgment, bu
 
 - **No more `[bg-timeout]` steering message.** `requestJobDecision` no longer calls `sendMessage` at all. The auto-backgrounded command's status reaches the agent through the bash tool result (now annotated *"auto-backgrounded after Ns; still running — check with jobs output if needed"*), exactly like CC.
 - **Passive toast only.** The human still gets a subtle *"Backgrounded X after Ns; still running"* toast so it's visible, but the agent's turn is never interrupted.
-- **`job_decide` remains available** if the agent or user explicitly wants to keep/kill/check — it's just no longer forced.
+- **Historical v1 only:** `job_decide` remained available in that release; v2 removed it.
 - Removed the now-unused `DELIVER_FOLLOWUP_WAKE` deliver constant (no path wakes on a system message anymore except the idle-path completion flush, which uses `DELIVER_STEER`).
 
 ### 1.1.5 — No more redundant acknowledgments (CC `notified` parity)

@@ -1,14 +1,14 @@
 // src/__tests__/spawn.test.ts
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync, existsSync, unlinkSync, mkdirSync } from "node:fs";
+import { readFileSync, existsSync, unlinkSync, mkdirSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 // Will import from spawn.ts once created
 // import { spawnWithFileOutput, killProcessTree, processExists } from "../spawn.ts";
 
-const testDir = join(tmpdir(), `pi-bg-test-${process.pid}`);
+const testDir = mkdtempSync(join(tmpdir(), `pi-bg-test-${process.pid}-`));
 
 /** Production intentionally unrefs detached children. Keep the Node test runner
  * alive while awaiting that unref'd child's exit, with a bounded failure. */
@@ -115,7 +115,7 @@ describe("spawnWithFileOutput", () => {
             assert.equal(raced.code, 0);
         } finally {
             // Clean up the lingering grandchild.
-            killProcessTree(result.pid, "SIGKILL");
+            killProcessTree(result.identity, "SIGKILL");
         }
         try { unlinkSync(logPath); } catch {}
     });
@@ -133,7 +133,7 @@ describe("killProcessTree", () => {
         });
         await new Promise((r) => setTimeout(r, 200));
         assert.ok(processExists(result.pid));
-        killProcessTree(result.pid);
+        killProcessTree(result.identity);
         await awaitExit(result.exit);
         // After exit, process should be gone (give OS a moment)
         await new Promise((r) => setTimeout(r, 100));

@@ -8,8 +8,7 @@
  */
 
 import { execSync } from "node:child_process";
-import { unlinkSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { closeSync, constants, openSync, unlinkSync, writeFileSync } from "node:fs";
 import type { ExtensionAPI, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { Type } from "@earendil-works/pi-ai";
 import type { BackgroundRegistry } from "../state.ts";
@@ -19,7 +18,7 @@ import {
     requireExistingCwd as requireCwd,
     startBackgroundJob,
 } from "../lifecycle.ts";
-import { add, createRunningJob, newJobId, logPathFor } from "../registry.ts";
+import { LOG_DIR, add, createRunningJob, newJobId, logPathFor } from "../registry.ts";
 import { spawnWithFileOutput, type SpawnResult } from "../spawn.ts";
 import { streamLog } from "../output.ts";
 import { textBlock } from "../format.ts";
@@ -122,8 +121,14 @@ export function registerAgentBgTool(pi: ExtensionAPI, reg: BackgroundRegistry): 
                 "", "Continue from where you left off.",
             ].join("\n");
 
-            const promptFile = `${tmpdir()}/pi-bg-prompt-${id}.md`;
-            writeFileSync(promptFile, promptContent);
+            const promptFile = `${LOG_DIR}/prompt-${id}.md`;
+            const promptFd = openSync(promptFile,
+                constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+            try { writeFileSync(promptFd, promptContent); }
+            catch (error) {
+                try { unlinkSync(promptFile); } catch { /* best-effort */ }
+                throw error;
+            } finally { closeSync(promptFd); }
 
             const model = ctx.model;
             const modelArg = model ? `${model.provider}/${model.id}` : undefined;
@@ -148,7 +153,7 @@ export function registerAgentBgTool(pi: ExtensionAPI, reg: BackgroundRegistry): 
             }
 
             const job = createRunningJob({
-                id, name: promptLabel, command: `pi -p (background agent)`, pid: spawned.pid,
+                id, name: promptLabel, command: `pi -p (background agent)`, pid: spawned.pid, identity: spawned.identity,
                 logPath, toolCallId, kind: "agent",
             });
             add(reg, job);
@@ -157,7 +162,7 @@ export function registerAgentBgTool(pi: ExtensionAPI, reg: BackgroundRegistry): 
             const progressPoller = streamLog(logPath, onUpdate);
             const jobAc = startBackgroundJob({
                 reg, pi, ctx, job, exit: spawned.exit,
-                onExit: () => { try { unlinkSync(promptFile); } catch { /* already gone */ } },
+                onCleanup: () => { try { unlinkSync(promptFile); } catch { /* already gone */ } },
             });
             jobAc.signal.addEventListener("abort", () => progressPoller.stop(), { once: true });
 

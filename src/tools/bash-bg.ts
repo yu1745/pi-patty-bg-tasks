@@ -27,7 +27,7 @@ export function registerBashBgTool(pi: ExtensionAPI, reg: BackgroundRegistry): v
         label: "Background Bash",
         description:
             "Start a bash command in the background immediately. " +
-            "Output is saved to /tmp/pi-bg/<jobId>.log.",
+            "Output is saved to a private temporary log path returned by the tool.",
         promptSnippet: "Start long-running commands directly in the background",
         promptGuidelines: [
             "Use bash_bg when a command should definitely start in the background.",
@@ -56,7 +56,7 @@ export function registerBashBgTool(pi: ExtensionAPI, reg: BackgroundRegistry): v
             });
 
             const job = createRunningJob({
-                id, name: p.name, command: p.command, pid: spawned.pid,
+                id, name: p.name, command: p.command, pid: spawned.pid, identity: spawned.identity,
                 logPath, toolCallId,
             });
             add(reg, job);
@@ -73,7 +73,7 @@ export function registerBashBgTool(pi: ExtensionAPI, reg: BackgroundRegistry): v
                     try {
                         appendFileSync(logPath, `Command timed out after ${p.timeout}s\n`);
                     } catch { /* best-effort — the kill below still happens */ }
-                    killProcessTree(job.pid, "SIGTERM");
+                    killProcessTree(job.identity, "SIGTERM");
                 }, p.timeout * 1000);
                 (timer as NodeJS.Timeout).unref();
                 jobAc.signal.addEventListener("abort", () => clearTimeout(timer), { once: true });

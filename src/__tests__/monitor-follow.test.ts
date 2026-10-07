@@ -4,6 +4,7 @@ import { appendFileSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { followLines } from "../monitor-follow.ts";
+import { openMonitorCapture, MONITOR_LOG_BYTES } from "../monitor-capture.ts";
 
 const dir = join(tmpdir(), `pi-bg-follow-${process.pid}`);
 mkdirSync(dir, { recursive: true });
@@ -79,6 +80,57 @@ void describe("monitor-follow / followLines", () => {
         await sleep(TICK * 2);
         f.stop(false);
         assert.deepEqual(seen, ["kept"]);
+    });
+
+    void it("bounds burst batches and newline-free lines", async () => {
+        const p = join(dir, "burst.log");
+        writeFileSync(p, "x".repeat(100_000) + "\n" + "a\n".repeat(20_000));
+        const batches: string[][] = [];
+        const f = followLines(p, (lines) => batches.push(lines), TICK);
+        await sleep(TICK * 10);
+        f.stop(true);
+        assert.ok(batches.length > 1);
+        assert.ok(batches.every((b) => b.length <= 128));
+        assert.ok(batches.flat().every((line) => line.length < 4200));
+        assert.ok(batches.flat()[0].endsWith("[line truncated]"));
+    });
+
+    void it("detects truncate/regrow even when the new size exceeds its old offset", async () => {
+        const p = join(dir, "rotation.log");
+        const capture = openMonitorCapture(p);
+        const seen: string[] = [];
+        const f = followLines(p, (lines) => seen.push(...lines), TICK);
+        capture.write(Buffer.from("initial\n"));
+        await sleep(TICK * 2);
+        capture.write(Buffer.alloc(MONITOR_LOG_BYTES - Buffer.byteLength("initial\n"), 120));
+        capture.write(Buffer.from("latest-new-output\n"));
+        f.stop(true);
+        capture.close();
+        assert.ok(seen.includes("latest-new-output"));
+        assert.ok(seen.some((line) => line.includes("rotated")));
+    });
+
+    void it("preserves UTF-8 split across read boundaries", () => {
+        const p = join(dir, "utf8.log");
+        writeFileSync(p, "a".repeat(16383) + "😀\n");
+        const seen: string[] = [];
+        const f = followLines(p, (lines) => seen.push(...lines), TICK);
+        f.stop(true);
+        assert.ok(!seen.join("").includes("�"));
+    });
+
+    void it("contains callback exceptions and keeps polling", async () => {
+        const p = join(dir, "throw.log");
+        writeFileSync(p, "one\n");
+        const errors: unknown[] = [];
+        let calls = 0;
+        const f = followLines(p, () => { calls++; throw new Error("delivery failed"); }, TICK, (e) => errors.push(e));
+        await sleep(TICK * 2);
+        appendFileSync(p, "two\n");
+        await sleep(TICK * 2);
+        f.stop();
+        assert.equal(calls, 2);
+        assert.equal(errors.length, 2);
     });
 
     void it("tolerates a not-yet-created log file", async () => {

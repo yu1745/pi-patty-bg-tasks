@@ -21,7 +21,6 @@ import {
     PREVIEW_CHARS,
     type UiContext,
 } from "../types.ts";
-import { processExists } from "../spawn.ts";
 import {
     cleanupTerminal,
     findJob,
@@ -36,7 +35,6 @@ import { searchLogs } from "../log-search.ts";
 import { markNotified } from "../notify.ts";
 import {
     ensureCompletionPromise,
-    markTerminal,
     terminateJobSilently,
 } from "../lifecycle.ts";
 
@@ -181,7 +179,8 @@ async function killAction(
     }
     // terminateJobSilently latches `notified` BEFORE the kill, so the exit
     // handler skips the <task-notification> — this result IS the outcome.
-    terminateJobSilently(reg, job);
+    const stopped = await terminateJobSilently(reg, job);
+    if (!stopped) throw new Error(`Could not confirm task stopped: ${job.id}`);
     renderSidebar(reg, ctx);
     // Claude Code's TaskStopTool result string (command collapsed to one line).
     return {
@@ -205,6 +204,7 @@ async function attachAction(
     const job = findJob(reg, jobId);
     if (!job) throw new Error(`No task found with ID: ${jobId}`);
     const label = jobLabel(job);
+    const generation = reg.generation;
 
     if (job.status === "running" && waitForCompletion) {
         ensureCompletionPromise(job);
@@ -213,11 +213,6 @@ async function attachAction(
         // on the abort path below, so a job we detach from still reports when
         // it ends.
         job.notified = true;
-
-        // Bail early if the OS process already died.
-        if (job.pid > 0 && !processExists(job.pid)) {
-            markTerminal(job, "failed");
-        }
 
         onUpdate?.({
             content: [
@@ -229,9 +224,14 @@ async function attachAction(
         // Stream the live log tail while we wait, so "attach" shows progress
         // instead of sitting silent.
         const poller = streamLog(job.logPath, onUpdate);
+        // A Promise alone does not keep a headless Node host alive. Only hold
+        // this reference while an explicit attach is awaiting its result.
+        const keepAlive = setInterval(() => {}, 1000);
         let onAbort: (() => void) | undefined;
         try {
-            if (signal && !signal.aborted) {
+            if (signal?.aborted) {
+                // Already cancelled: do not start an uninterruptible wait.
+            } else if (signal) {
                 const abortPromise = new Promise<void>((resolve) => {
                     onAbort = resolve;
                     signal.addEventListener("abort", onAbort, { once: true });
@@ -241,6 +241,7 @@ async function attachAction(
                 await job.donePromise;
             }
         } finally {
+            clearInterval(keepAlive);
             poller.stop();
             if (signal && onAbort) signal.removeEventListener("abort", onAbort);
         }
@@ -260,8 +261,18 @@ async function attachAction(
         }
     }
 
+    if (job.status === "running") {
+        return {
+            content: [textBlock(`${label} is still running. Use jobs output to check on it.`)],
+            details: undefined,
+        };
+    }
+
     const message = `${label} finished. Status: ${job.status}`;
-    ctx.ui.notify(message, job.status === "failed" ? "error" : "info");
+    if (!reg.disposed && reg.generation === generation) {
+        try { ctx.ui.notify(message, job.status === "failed" ? "error" : "info"); }
+        catch { /* Tool outcome and cleanup do not depend on an expired UI. */ }
+    }
     // The attach result IS the outcome notification — mark it notified so the
     // <task-notification> is suppressed (CC parity). Covers both the "attached
     // to an already-terminal job" and "waited then finished" cases; idempotent

@@ -35,10 +35,10 @@ void describe("processExists", () => {
 void describe("killProcessTree", () => {
     void it("PID 0 / negative / undefined are no-ops", () => {
         // Must not throw.
-        killProcessTree(0);
-        killProcessTree(-1);
+        killProcessTree(0 as never);
+        killProcessTree(-1 as never);
         killProcessTree(undefined);
-        killProcessTree(12345678, "SIGTERM"); // dead PID — must not throw.
+        killProcessTree(12345678 as never, "SIGTERM"); // dead PID — must not throw.
     });
 });
 

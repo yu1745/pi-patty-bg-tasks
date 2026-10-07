@@ -16,6 +16,10 @@ export class BackgroundRegistry {
     jobAborts = new Map<string, AbortController>();
 
     nonInteractive = false;
+    /** Async callbacks must match this runtime generation and never call host
+     * APIs after shutdown. A new session can reuse the extension instance. */
+    disposed = false;
+    generation = 0;
 
     completedCount = 0;
     failedCount = 0;

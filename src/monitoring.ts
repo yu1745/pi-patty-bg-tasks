@@ -24,7 +24,7 @@ import { describeJob } from "./format.ts";
 
 /**
  * Detect a stalled job. When the output file:
- *   1. exceeds MAX_LOG_BYTES, call onOversize and report the job terminated;
+ *   1. exceeds MAX_LOG_BYTES, call onOversize and report termination requested;
  *   2. has not grown for STALL_THRESHOLD_MS and its tail matches an interactive
  *      prompt pattern, send a bg-stall warning.
  *
@@ -38,6 +38,7 @@ export function watchStalls(args: {
     logPath: string;
     pi: ExtensionAPI;
     onOversize?: () => void;
+    isActive?: () => boolean;
     /** Skip the interactive-prompt stall heuristic (used for monitors). */
     disablePromptStall?: boolean;
     /** Skip the oversize auto-kill (used for persistent monitors). */
@@ -47,24 +48,36 @@ export function watchStalls(args: {
     let lastGrowth = Date.now();
     let lastPromptCheckSize = -1;
     let cancelled = false;
+    let oversizeHandled = false;
+    let pendingWarning: (() => void) | undefined;
+    let deliveryFailures = 0;
 
     const tick = () => {
-        if (cancelled) return;
+        if (cancelled || args.isActive?.() === false) return;
         try {
+            if (pendingWarning) {
+                pendingWarning();
+                cancelled = true;
+                return;
+            }
             const { size } = fsStatSync(args.logPath);
 
             if (size > MAX_LOG_BYTES && !args.disableOversizeKill) {
-                cancelled = true;
-                if (args.onOversize) args.onOversize();
-                args.pi.sendMessage(
+                if (!oversizeHandled) {
+                    oversizeHandled = true;
+                    args.onOversize?.();
+                }
+                pendingWarning = () => args.pi.sendMessage(
                     {
                         customType: EVENT.stall,
-                        content: `⚠️ Background job ${args.jobId} exceeded ${MAX_LOG_BYTES / (1024 * 1024)} MiB output. Terminated.`,
+                        content: `⚠️ Background job ${args.jobId} exceeded ${MAX_LOG_BYTES / (1024 * 1024)} MiB output. Termination requested.`,
                         display: true,
                         details: { jobId: args.jobId, logPath: args.logPath, command: args.command },
                     },
                     DELIVER_FOLLOWUP
                 );
+                pendingWarning();
+                cancelled = true;
                 return;
             }
 
@@ -88,18 +101,23 @@ export function watchStalls(args: {
                     readSync(fd, buf, 0, toRead, readStart);
                     const tail = buf.toString("utf-8", 0, toRead);
                     if (looksLikePrompt(tail)) {
+                        pendingWarning = () => sendStallPrompt(args.pi, args.jobId, describeJob(args.name, args.command), args.logPath, tail);
+                        pendingWarning();
                         cancelled = true;
-                        sendStallPrompt(args.pi, args.jobId, describeJob(args.name, args.command), args.logPath, tail);
                         return;
                     }
                 } finally {
                     closeSync(fd);
                 }
             }
-        } catch {
-            /* File may not exist yet — retry next tick. */
+        } catch (error) {
+            if (pendingWarning) {
+                console.error("[bg-tasks] warning delivery failed:", error);
+                cancelled = ++deliveryFailures >= 4;
+            }
+            // Missing log files remain retryable; delivery retries are bounded.
         }
-        schedule();
+        if (!cancelled) schedule();
     };
     // Re-arm with a fresh timer each tick (rather than refresh()) so the
     // watcher also works under node:test mock timers. Global setTimeout —

@@ -19,7 +19,8 @@ export async function openBgListPanel(
     ctx: UiContext
 ): Promise<void> {
     // Use select()-based panel (works in both command and shortcut contexts).
-    while (true) {
+    const generation = reg.generation;
+    while (!reg.disposed && reg.generation === generation) {
         const jobs = getJobList(reg);
         if (jobs.length === 0) {
             ctx.ui.notify("No background tasks", "info");
@@ -36,7 +37,7 @@ export async function openBgListPanel(
         });
 
         const choice = await ctx.ui.select("Background Tasks", items);
-        if (choice === undefined) return;
+        if (choice === undefined || reg.disposed || reg.generation !== generation) return;
 
         const idx = items.indexOf(choice);
         const job = jobs[idx];
@@ -53,6 +54,8 @@ async function showJobActions(
     ctx: UiContext
 ): Promise<boolean> {
     const name = jobLabel(job);
+    const generation = reg.generation;
+    const isActive = () => !reg.disposed && reg.generation === generation;
 
     if (job.status === "running") {
         const options = ["Show Output", "Kill", "← Back"];
@@ -60,12 +63,14 @@ async function showJobActions(
             `▶ ${name} · ${job.command.slice(0, PREVIEW_CHARS.detail)}`,
             options
         );
-        if (action === undefined) return false;
+        if (action === undefined || !isActive()) return false;
         if (action === "Show Output") { await showOutput(job, ctx); return true; }
         if (action === "Kill") {
-            terminateJobSilently(reg, job);
+            const stopped = await terminateJobSilently(reg, job);
+            if (!isActive()) return false;
             renderSidebar(reg, ctx);
-            ctx.ui.notify(`Killed ${name}`, "info");
+            try { ctx.ui.notify(stopped ? `Killed ${name}` : `Could not confirm termination of ${name}`, stopped ? "info" : "error"); }
+            catch { return false; }
             return true;
         }
         return true;
@@ -73,7 +78,7 @@ async function showJobActions(
 
     const options = ["Show Output", "Remove", "← Back"];
     const action = await ctx.ui.select(`${statusIcon(job)} ${name} · ${job.status}`, options);
-    if (action === undefined) return false;
+    if (action === undefined || !isActive()) return false;
     if (action === "Show Output") { await showOutput(job, ctx); return true; }
     if (action === "Remove") {
         forget(reg, job);

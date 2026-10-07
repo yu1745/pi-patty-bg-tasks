@@ -7,7 +7,9 @@
  */
 
 import { randomInt } from "node:crypto";
-import { statSync, unlinkSync } from "node:fs";
+import { mkdtempSync, statSync, unlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { formatDuration, jobLabel } from "./format.ts";
 import {
     isTerminalStatus,
@@ -47,7 +49,7 @@ export function newJobId(kind: JobKind, reg?: BackgroundRegistry): string {
 
 /** Dedicated log directory. Keeping logs in their own dir (not loose in /tmp)
  *  keeps the stale-log sweep bounded — it lists only our files. */
-export const LOG_DIR = "/tmp/pi-bg";
+export const LOG_DIR = mkdtempSync(join(tmpdir(), "pi-patty-bg-"));
 
 export function logPathFor(jobId: string): string {
     return `${LOG_DIR}/${jobId}.log`;
@@ -68,6 +70,7 @@ export function createRunningJob(args: {
     id: string;
     command: string;
     pid: number;
+    identity?: Job["identity"];
     logPath: string;
     toolCallId: string;
     name?: string;
@@ -80,6 +83,7 @@ export function createRunningJob(args: {
         name: args.name,
         command: args.command,
         pid: args.pid,
+        identity: args.identity,
         startTime: Date.now(),
         status: "running",
         logPath: args.logPath,
@@ -119,7 +123,7 @@ export function atConcurrencyLimit(reg: BackgroundRegistry): boolean {
  * Returns the removed job (or undefined if it wasn't in the map).
  */
 export function forget(reg: BackgroundRegistry, job: Job): Job | undefined {
-    if (!reg.jobs.delete(job.id)) return undefined;
+    if (reg.jobs.get(job.id) !== job || !reg.jobs.delete(job.id)) return undefined;
     if (job.status === "completed") {
         reg.completedCount++;
         reg.totalDurationMs += terminalDurationMs(job);
@@ -131,7 +135,11 @@ export function forget(reg: BackgroundRegistry, job: Job): Job | undefined {
     }
     reg.recentTerminal.push(job);
     if (reg.recentTerminal.length > RECENT_TERMINAL_KEEP) {
-        reg.recentTerminal.shift();
+        const dropped = reg.recentTerminal.shift();
+        if (dropped) {
+            deleteLogFile(dropped.logPath);
+            deleteLogFile(dropped.logPath.replace(/\.log$/, ".err"));
+        }
     }
     return job;
 }
@@ -156,7 +164,7 @@ export function cleanupTerminal(reg: BackgroundRegistry): {
     const deleteOnce = (logPath: string): number => {
         if (deletedLogs.has(logPath)) return 0;
         deletedLogs.add(logPath);
-        return deleteLogFile(logPath);
+        return deleteLogFile(logPath) + deleteLogFile(logPath.replace(/\.log$/, ".err"));
     };
 
     const idsToRemove: string[] = [];
@@ -179,6 +187,11 @@ export function cleanupTerminal(reg: BackgroundRegistry): {
     return { purged, bytesReclaimed: bytes };
 }
 
+/** Drop captures when their metadata leaves a disposed runtime. */
+export function deleteJobLogs(job: Job): number {
+    return deleteLogFile(job.logPath) + deleteLogFile(job.logPath.replace(/\.log$/, ".err"));
+}
+
 function deleteLogFile(logPath: string): number {
     try {
         const { size } = statSync(logPath);
@@ -198,6 +211,18 @@ function deleteLogFile(logPath: string): number {
  * actually changes. Call after any state change that affects running jobs.
  */
 export function renderSidebar(reg: BackgroundRegistry, ctx: UiContext): void {
+    if (reg.disposed) { stopSidebarTicker(reg); return; }
+    try {
+        renderSidebarActive(reg, ctx);
+    } catch {
+        // UI contexts expire on reload/session replacement. State cleanup must
+        // not depend on rendering, including non-timer callers at job exit.
+        reg.lastSidebarContent = undefined;
+        stopSidebarTicker(reg);
+    }
+}
+
+function renderSidebarActive(reg: BackgroundRegistry, ctx: UiContext): void {
     const pills: string[] = [];
     let runningCount = 0;
     const runningLogs = new Set<string>();

@@ -13,6 +13,7 @@ import { BackgroundRegistry } from "../state.ts";
 import { registerJobsTool } from "../tools/jobs.ts";
 import { add, createRunningJob } from "../registry.ts";
 import { markNotified } from "../notify.ts";
+import { markTerminal } from "../lifecycle.ts";
 import type { Job, UiContext } from "../types.ts";
 
 const dir = join(tmpdir(), `pi-bg-jobs-${process.pid}`);
@@ -120,6 +121,28 @@ void describe("jobs output — read-marks-notified", () => {
             () => tool.execute("t5", { action: "output", jobId: "ghost" }, undefined, undefined, ctx),
             /No task found with ID: ghost/
         );
+    });
+});
+
+void describe("jobs attach — nonblocking", () => {
+    void it("awaits authoritative clean exit even after the PID has disappeared", async () => {
+        const { tool, reg, ctx } = harness();
+        const job = mkJob(reg, { id: `job-${process.pid}-dead-pid`, pid: 2147483647 });
+        const pending = tool.execute("a", { action: "attach", jobId: job.id }, undefined, undefined, ctx);
+        setImmediate(() => markTerminal(job, "completed", 0));
+        const result = await pending;
+        assert.equal(job.status, "completed");
+        assert.match(result.content[0].text, /Status: completed/);
+    });
+    void it("does not announce completion or suppress future notification", async () => {
+        const { tool, reg, ctx } = harness();
+        let toasts = 0;
+        ctx.ui.notify = () => { toasts++; };
+        const job = mkJob(reg, { id: `job-${process.pid}-attach` });
+        const result = await tool.execute("a", { action: "attach", jobId: job.id, wait: false }, undefined, undefined, ctx);
+        assert.match(result.content[0].text, /still running/);
+        assert.equal(job.notified, undefined);
+        assert.equal(toasts, 0);
     });
 });
 

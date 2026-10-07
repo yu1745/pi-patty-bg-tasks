@@ -73,6 +73,16 @@ void describe("background hint", () => {
         assert.equal(calls[1].content, undefined);
     });
 
+    void it("stale UI cannot throw or leak hint ref-counts", () => {
+        const stale = { get ui(): never { throw new Error("stale context"); } } as UiContext;
+        assert.doesNotThrow(() => showBackgroundHint(stale));
+        assert.doesNotThrow(() => clearBackgroundHint(stale));
+        const { calls, ctx } = makeCtx();
+        showBackgroundHint(ctx);
+        assert.equal(calls.length, 1);
+        clearBackgroundHint(ctx);
+    });
+
     void it("clear is a no-op when nothing is shown", () => {
         const { calls, ctx } = makeCtx();
         clearBackgroundHint(ctx);

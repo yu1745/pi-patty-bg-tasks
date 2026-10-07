@@ -64,7 +64,30 @@ function onlyJob(reg: BackgroundRegistry): Job {
 }
 
 void describe("bash tool — Claude Code tool-result strings", () => {
-    const spawnedPids: number[] = [];
+    const spawnedPids: Job["identity"][] = [];
+
+    void it("headless timeout still promotes long-running commands", async () => {
+        const { tool, reg, ctx } = harness();
+        reg.nonInteractive = true;
+        const result = await withTimeout(tool.execute("headless", { command: "sleep 30", timeout: 0.05 }, undefined, undefined, ctx));
+        const job = onlyJob(reg);
+        spawnedPids.push(job.identity);
+        assert.equal(job.isBackgrounded, true);
+        assert.match(result.content[0].text, /running in background/);
+    });
+
+    void it("enforces the output budget before foreground promotion", async () => {
+        const { tool, reg, ctx } = harness();
+        const command = `${JSON.stringify(process.execPath)} -e "require('node:fs').ftruncateSync(1,104857601);setTimeout(()=>{},30000)"`;
+        await assert.rejects(withTimeout(tool.execute("oversize", { command }, undefined, undefined, ctx)), /exceeded output limit/);
+        assert.equal(reg.jobs.size, 0);
+        assert.equal(reg.foreground.size, 0);
+    });
+
+    void it("external signal death is a failure rather than success", async () => {
+        const { tool, ctx } = harness();
+        await assert.rejects(tool.execute("signal", { command: "kill -TERM $$" }, undefined, undefined, ctx), /SIGTERM/);
+    });
 
     void it("run_in_background returns the generic CC string (no Name fragment)", async () => {
         const { tool, reg, ctx } = harness();
@@ -76,7 +99,7 @@ void describe("bash tool — Claude Code tool-result strings", () => {
             ctx
         );
         const job = onlyJob(reg);
-        spawnedPids.push(job.pid);
+        spawnedPids.push(job.identity);
         assert.equal(
             res.content[0].text,
             `Command running in background with ID: ${job.id}. Output is being written to: ${job.logPath}`
@@ -96,7 +119,7 @@ void describe("bash tool — Claude Code tool-result strings", () => {
         reg.foreground.get("t2")?.requestPause("manual");
         const res = await withTimeout(pending);
         const job = onlyJob(reg);
-        spawnedPids.push(job.pid);
+        spawnedPids.push(job.identity);
         assert.equal(
             res.content[0].text,
             `Command was manually backgrounded by user with ID: ${job.id}. Output is being written to: ${job.logPath}`
@@ -113,7 +136,7 @@ void describe("bash tool — Claude Code tool-result strings", () => {
             ctx
         ));
         const job = onlyJob(reg);
-        spawnedPids.push(job.pid);
+        spawnedPids.push(job.identity);
         assert.equal(
             res.content[0].text,
             `Command running in background with ID: ${job.id}. Output is being written to: ${job.logPath}`
@@ -130,7 +153,7 @@ void describe("bash tool — Claude Code tool-result strings", () => {
             ctx
         ));
         const job = onlyJob(reg);
-        spawnedPids.push(job.pid);
+        spawnedPids.push(job.identity);
         assert.equal(
             res.content[0].text,
             `Command running in background with ID: ${job.id}. Output is being written to: ${job.logPath}`
@@ -149,7 +172,7 @@ void describe("bash tool — Claude Code tool-result strings", () => {
         const job = onlyJob(reg);
         // External kill — node reports code null + the signal; the job must
         // NOT be misreported as completed.
-        killProcessTree(job.pid, "SIGKILL");
+        killProcessTree(job.identity, "SIGKILL");
         await sleep(300);
 
         const terminals = messages.filter((m) => m.customType === EVENT.taskNotification);

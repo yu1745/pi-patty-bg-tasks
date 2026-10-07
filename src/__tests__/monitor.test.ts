@@ -10,7 +10,7 @@ import { openWsSource, isWsSupported } from "../monitor-ws.ts";
 import { EVENT } from "../types.ts";
 
 const dir = join(tmpdir(), `pi-bg-monitor-${process.pid}`);
-mkdirSync(dir, { recursive: true });
+mkdirSync(dir, { recursive: true, mode: 0o700 });
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 async function withTimeout<T>(promise: Promise<T>, timeoutMs = 5_000): Promise<T> {
@@ -158,6 +158,9 @@ class FakeWS {
     }
     addEventListener(type: string, cb: (ev: unknown) => void) {
         (this.listeners[type] ??= []).push(cb);
+    }
+    removeEventListener(type: string, cb: (ev: unknown) => void) {
+        this.listeners[type] = (this.listeners[type] ?? []).filter((listener) => listener !== cb);
     }
     close() {
         this.dispatch("close", { code: 1000, reason: "" });

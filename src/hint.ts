@@ -21,17 +21,20 @@ let activeHints = 0;
 export function showBackgroundHint(ctx: UiContext): void {
     activeHints++;
     if (activeHints === 1) {
-        ctx.ui.setWidget(HINT_KEY, ["(ctrl+shift+b to run in background)"], {
-            placement: "belowEditor",
-        });
+        try {
+            ctx.ui.setWidget(HINT_KEY, ["(ctrl+shift+b to run in background)"], {
+                placement: "belowEditor",
+            });
+        } catch { /* Rendering must not strand foreground cleanup on stale ctx. */ }
     }
 }
 
 /** Release one hint; clears the widget only when the last command is done. */
-export function clearBackgroundHint(ctx: UiContext): void {
+export function clearBackgroundHint(ctx: UiContext, render = true): void {
     if (activeHints === 0) return;
     activeHints--;
-    if (activeHints === 0) {
-        ctx.ui.setWidget(HINT_KEY, undefined);
+    if (activeHints === 0 && render) {
+        try { ctx.ui.setWidget(HINT_KEY, undefined); }
+        catch { /* Old session UI is already gone. */ }
     }
 }

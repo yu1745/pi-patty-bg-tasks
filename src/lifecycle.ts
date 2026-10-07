@@ -16,8 +16,8 @@ import {
     type UiContext,
 } from "./types.ts";
 import type { BackgroundRegistry } from "./state.ts";
-import { killProcessTree, type SpawnExit } from "./spawn.ts";
-import { atConcurrencyLimit, forget, renderSidebar } from "./registry.ts";
+import { killProcessTree, processExists, type SpawnExit } from "./spawn.ts";
+import { atConcurrencyLimit, deleteJobLogs, forget, renderSidebar } from "./registry.ts";
 import { watchStalls } from "./monitoring.ts";
 import { markNotified, sendTaskNotification } from "./notify.ts";
 
@@ -49,11 +49,14 @@ export function startBackgroundJob(args: {
     /** Suppress the interactive-prompt stall heuristic (monitors stream their
      *  own output, so a quiet tail is normal, not a stuck prompt). */
     disablePromptStall?: boolean;
-    /** Suppress the oversize auto-kill (persistent log tails are expected to
-     *  grow without bound). */
+    /** Suppress the ordinary-job oversize kill for independently bounded sources. */
     disableOversizeKill?: boolean;
+    /** Session-bound completion work; fenced after disposal/replacement. */
     onExit?: (result: SpawnExit) => void;
+    /** Resource-only teardown, always run even when the host context expires. */
+    onCleanup?: (result: SpawnExit) => void;
 }): AbortController {
+    const generation = args.reg.generation;
     ensureCompletionPromise(args.job);
     const jobAc = createJobAbort(args.reg, args.job.id);
     args.reg.watchdog?.track(args.job, args.ctx, jobAc.signal);
@@ -65,11 +68,22 @@ export function startBackgroundJob(args: {
         pi: args.pi,
         disablePromptStall: args.disablePromptStall,
         disableOversizeKill: args.disableOversizeKill,
-        onOversize: () => terminateJobSilently(args.reg, args.job),
+        isActive: () => !args.reg.disposed && args.reg.generation === generation,
+        // Preserve the authoritative completion notice even when the warning
+        // fails or cleanup aborts its retry timer.
+        onOversize: () => { void terminateJob(args.job); },
     });
     jobAc.signal.addEventListener("abort", cancelStall, { once: true });
     void args.exit.then((result) => {
-        args.onExit?.(result);
+        try {
+            if (!args.reg.disposed && args.reg.generation === generation) args.onExit?.(result);
+        } catch (error) {
+            console.error("[bg-tasks] exit callback failed:", error);
+        } finally {
+            try { args.onCleanup?.(result); }
+            catch (error) { console.error("[bg-tasks] resource cleanup failed:", error); }
+            jobAc.abort();
+        }
         completeJob({
             job: args.job,
             code: result.code,
@@ -78,6 +92,7 @@ export function startBackgroundJob(args: {
             pi: args.pi,
             ctx: args.ctx,
             shouldNotify: args.shouldNotify,
+            generation,
         });
     });
     renderSidebar(args.reg, args.ctx);
@@ -110,15 +125,25 @@ export function completeJob(args: {
     pi: ExtensionAPI;
     ctx: UiContext;
     shouldNotify?: boolean;
+    generation?: number;
 }): void {
+    // Always clean resources, including an exit arriving after prior marking.
+    if (args.reg.jobs.get(args.job.id) === args.job) abortJob(args.reg, args.job.id);
     if (isTerminalStatus(args.job.status)) return;
     // The caller passes the authoritative Job (the object held in the registry),
     // so no lookup is needed.
     const finished = args.job;
-    abortJob(args.reg, finished.id);
     markTerminal(finished, statusFromExit(args.code, args.signal), args.code ?? undefined);
+    if (args.reg.disposed || (args.generation !== undefined && args.generation !== args.reg.generation)) {
+        markNotified(finished);
+        if (args.reg.jobs.get(finished.id) === finished) args.reg.jobs.delete(finished.id);
+        deleteJobLogs(finished);
+        return;
+    }
     if (args.shouldNotify !== false) {
         sendTaskNotification({ reg: args.reg, pi: args.pi, job: finished });
+        // Monitors may already have sent their richer summary in onExit.
+        if (finished.kind === "monitor" && finished.notified) forget(args.reg, finished);
     } else {
         markNotified(finished);
         forget(args.reg, finished);
@@ -128,7 +153,7 @@ export function completeJob(args: {
 
 /**
  * Mark a job terminal and resolve its donePromise. Idempotent — already-
- * terminal jobs are ignored. The proc reference is dropped explicitly for GC.
+ * terminal jobs are ignored.
  */
 export function markTerminal(
     job: Job,
@@ -140,7 +165,6 @@ export function markTerminal(
     }
     job.status = status;
     job.exitCode = exitCode;
-    delete job.proc;
     if (job.resolveDone) {
         job.resolveDone();
         delete job.resolveDone;
@@ -184,14 +208,25 @@ export function markKilledSilently(job: Job): void {
     markNotified(job);
 }
 
-/** Kill a job quietly and abort its registered monitors/timers. The notified
- *  latch is set BEFORE the kill so the exit handler's notification is
- *  suppressed (Ctrl+Shift+X, jobs kill, session quit). */
-export function terminateJobSilently(reg: BackgroundRegistry, job: Job): void {
+/* Kill quietly and abort registered monitors/timers. Suppress notifications
+ * before signalling, but keep status running until death is observed. Returns
+ * false if bounded escalation cannot confirm death; callers must not claim
+ * successful termination in that case. */
+const silentTerminations = new WeakMap<Job, Promise<boolean>>();
+export function terminateJobSilently(reg: BackgroundRegistry, job: Job): Promise<boolean> {
+    const existing = silentTerminations.get(job);
+    if (existing) return existing;
+    const wasNotified = job.notified;
     markNotified(job);
-    terminateJob(job);
-    markKilledSilently(job);
     abortJob(reg, job.id);
+    const result = terminateJob(job).then((stopped) => {
+        if (stopped) markKilledSilently(job);
+        else if (!isTerminalStatus(job.status)) job.notified = wasNotified;
+        return stopped;
+    });
+    silentTerminations.set(job, result);
+    void result.then(() => silentTerminations.delete(job));
+    return result;
 }
 
 // --- Per-job abort (cleanup) ---------------------------------------------
@@ -218,18 +253,51 @@ export function abortJob(reg: BackgroundRegistry, jobId: string): void {
 }
 
 /**
- * Kill a job — SIGTERM the live process group if the proc handle is present,
- * otherwise signal the recorded PID directly (covers jobs whose proc handle
- * was already dropped).
+ * In-flight termination operations are shared across concurrent callers.
+ * Process-group liveness also covers descendants after the direct child exits.
  */
-export function terminateJob(job: Job): void {
-    // Monitors carry a transient teardown hook (follower + ws socket). A ws
-    // monitor has pid 0, so the process-tree kill below is a no-op for it and
-    // job.stop does the real work; a command monitor needs both.
-    job.stop?.();
-    // No liveness probe: killProcessTree already swallows ESRCH, and probing
-    // first would be a TOCTOU race. killProcessTree itself guards pid <= 0.
-    killProcessTree(job.proc?.pid ?? job.pid, "SIGTERM");
+const terminations = new WeakMap<Job, Promise<boolean>>();
+
+/** Bounded TERM → KILL escalation. Keep the timer referenced until cleanup
+ * finishes, even in print mode; never claim death solely from sending TERM. */
+export function terminateJob(job: Job): Promise<boolean> {
+    const existing = terminations.get(job);
+    if (existing) return existing;
+    const pid = job.pid;
+    const target = job.identity; // A displayed PID is never signal authority.
+    const alive = () => {
+        if (job.identity) return processExists(job.identity);
+        if (pid <= 0) return false;
+        try {
+            process.kill(-pid, 0);
+            return true;
+        } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === "EPERM") return true;
+            return processExists(pid);
+        }
+    };
+    // Register before stop(), since a source may synchronously resolve exit.
+    const result = Promise.resolve().then(async () => {
+        try { job.stop?.(); } catch (error) {
+            console.error("[bg-tasks] source teardown failed:", error);
+        }
+        killProcessTree(target, "SIGTERM");
+        for (let attempt = 0; attempt < 40; attempt++) {
+            if (!alive()) return true;
+            if (attempt === 20) killProcessTree(target, "SIGKILL");
+            await new Promise<void>((resolve) => setTimeout(resolve, 50));
+        }
+        const stopped = !alive();
+        if (!stopped) console.error(`[bg-tasks] could not confirm termination of ${job.id} (pid ${pid})`);
+        return stopped;
+    });
+    terminations.set(job, result);
+    void result.then((stopped) => {
+        // A failed attempt is not a permanent tombstone: an operator may retry
+        // after the cause (e.g. permissions) changes.
+        if (!stopped) terminations.delete(job);
+    });
+    return result;
 }
 
 // --- Foreground backgrounding --------------------------------------------

@@ -8,7 +8,8 @@
  * makes a third source (named pipe, file replay, …) a drop-in later.
  */
 
-import { spawnWithFileOutput, type SpawnExit } from "./spawn.ts";
+import { killProcessTree, spawnSupervisedProcess, type ProcessIdentity, type SpawnExit } from "./spawn.ts";
+import { openMonitorCapture } from "./monitor-capture.ts";
 import { openWsSource, type WsSpec } from "./monitor-ws.ts";
 
 export interface MonitorSource {
@@ -16,6 +17,7 @@ export interface MonitorSource {
     logPath: string;
     /** OS pid backing the source, or 0 when there is no process (ws). */
     pid: number;
+    identity?: ProcessIdentity;
     /** Human-readable label shown in the sidebar / jobs list. */
     label: string;
     /** Resolves when the source ends (process exit, or ws close as code-only). */
@@ -32,19 +34,75 @@ export function spawnCommandSource(args: {
     logPath: string;
     errPath: string;
 }): MonitorSource {
-    const spawned = spawnWithFileOutput({
-        command: args.command,
-        cwd: args.cwd,
-        logPath: args.logPath,
-        errPath: args.errPath,
+    const out = openMonitorCapture(args.logPath);
+    let err: ReturnType<typeof openMonitorCapture>;
+    try { err = openMonitorCapture(args.errPath); }
+    catch (error) { out.close(); throw error; }
+    let proc: ReturnType<typeof spawnSupervisedProcess>;
+    try {
+        proc = spawnSupervisedProcess({
+            file: "bash", fileArgs: ["-c", args.command], cwd: args.cwd,
+            stdout: "pipe", stderr: "pipe",
+        });
+    } catch (error) { out.close(); err.close(); throw error; }
+    let settled = false;
+    let resolveExit!: (result: SpawnExit) => void;
+    const exit = new Promise<SpawnExit>((resolve) => { resolveExit = resolve; });
+    const settle = (result: SpawnExit) => {
+        if (settled) return;
+        settled = true;
+        proc.stdout?.destroy();
+        proc.stderr?.destroy();
+        try { out.close(); } catch { result = { code: 1, signal: null }; }
+        try { err.close(); } catch { result = { code: 1, signal: null }; }
+        resolveExit(result);
+    };
+    let captureFailed = false;
+    let commandExit: SpawnExit | undefined;
+    const fail = () => {
+        captureFailed = true;
+        proc.ref();
+        killProcessTree(proc.identity, "SIGKILL");
+        proc.stdout?.destroy();
+        proc.stderr?.destroy();
+        if (!proc.pid) settle({ code: 1, signal: null });
+    };
+    proc.stdout?.on("data", (chunk: Buffer) => {
+        if (settled) return;
+        try { out.write(chunk); } catch { fail(); }
     });
+    proc.stderr?.on("data", (chunk: Buffer) => {
+        if (settled) return;
+        try { err.write(chunk); } catch { fail(); }
+    });
+    proc.stdout?.on("error", fail);
+    proc.stderr?.on("error", fail);
+    proc.on("error", fail);
+    // Drain buffered pipe output before reporting completion. Descendants that
+    // inherit pipes can delay close; stop() explicitly tears those pipes down.
+    proc.on("message", (message: unknown) => {
+        const result = message as SpawnExit;
+        if (result && (result.code === null || typeof result.code === "number") &&
+            (result.signal === null || typeof result.signal === "string")) commandExit = result;
+    });
+    proc.on("close", (code, signal) => settle(captureFailed ? { code: 1, signal: null } : commandExit ?? { code, signal }));
+    // Capture pipes must not pin a background-only host either.
+    for (const stream of [proc.stdout, proc.stderr]) {
+        if (stream && "unref" in stream && typeof stream.unref === "function") stream.unref();
+    }
+    proc.unref();
     return {
         logPath: args.logPath,
-        pid: spawned.pid,
+        pid: proc.pid ?? 0,
+        identity: proc.identity,
         label: args.command,
-        exit: spawned.exit,
-        // The process group is killed by the standard kill path; nothing extra.
-        stop: () => {},
+        exit,
+        stop: () => {
+            if (settled) return;
+            // Lifecycle owns bounded escalation; report exit only on close.
+            proc.ref();
+            killProcessTree(proc.identity);
+        },
     };
 }
 

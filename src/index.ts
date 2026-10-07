@@ -15,7 +15,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createBashToolDefinition } from "@earendil-works/pi-coding-agent";
 import { BackgroundRegistry } from "./state.ts";
 import { detectNonInteractive, terminateJobSilently } from "./lifecycle.ts";
-import { stopSidebarTicker } from "./registry.ts";
+import { cleanupTerminal, stopSidebarTicker } from "./registry.ts";
 import { EVENT } from "./types.ts";
 import { registerBashTool } from "./tools/bash.ts";
 import { registerBashBgTool } from "./tools/bash-bg.ts";
@@ -41,7 +41,9 @@ export default function (pi: ExtensionAPI): void {
     registerBashTool(pi, reg, originalBash);
     registerBashBgTool(pi, reg);
     registerJobsTool(pi, reg);
-    registerAgentBgTool(pi, reg);
+    if (!/^(1|true|yes)$/i.test(process.env.PI_PATTY_DISABLE_AGENT_BG ?? "")) {
+        registerAgentBgTool(pi, reg);
+    }
     registerMonitorTool(pi, reg);
 
     // ── Shortcuts / commands ──────────────────────────────────────
@@ -129,6 +131,15 @@ export default function (pi: ExtensionAPI): void {
     // Claude Code parity: the registry is purely in-memory — no persistence,
     // no revival. Every session starts with an empty registry.
     pi.on("session_start", async (_event, _ctx) => {
+        if (reg.disposed) {
+            // The host may reuse this factory for a replacement session. Old
+            // callbacks retain the previous generation and cannot notify here.
+            reg.jobs.clear();
+            reg.recentTerminal.length = 0;
+            reg.foreground.clear();
+            reg.disposed = false;
+            reg.watchdog = createJobWatchdog(pi, reg);
+        }
         reg.nonInteractive = detectNonInteractive(
             process.argv,
             Boolean(process.stdin.isTTY)
@@ -137,6 +148,10 @@ export default function (pi: ExtensionAPI): void {
 
     // ── Session shutdown ──────────────────────────────────────────
     pi.on("session_shutdown", async (_event, _ctx) => {
+        if (reg.disposed) return;
+        reg.disposed = true;
+        reg.generation++;
+        reg.foreground.clear();
         // Stop semantic/process samplers before terminating jobs.
         reg.watchdog?.dispose();
 
@@ -146,11 +161,14 @@ export default function (pi: ExtensionAPI): void {
         // Claude Code's gracefulShutdown: kill ALL running tasks on ANY
         // shutdown reason, so no orphans outlive the session. The silent-kill
         // path latches `notified`, so no <task-notification> fires on the way
-        // out. Log files are left for the OS to clean.
+        // out. Terminal stdout/stderr captures are removed after cleanup.
+        const stopping: Promise<boolean>[] = [];
         for (const job of reg.jobs.values()) {
             if (job.status === "running") {
-                terminateJobSilently(reg, job);
+                stopping.push(terminateJobSilently(reg, job));
             }
         }
+        await Promise.all(stopping);
+        cleanupTerminal(reg);
     });
 }

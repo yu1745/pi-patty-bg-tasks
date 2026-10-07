@@ -79,7 +79,12 @@ async function handleCtrlX(
     }
 
     const target = running[0];
-    terminateJobSilently(reg, target);
+    const generation = reg.generation;
+    const stopped = await terminateJobSilently(reg, target);
+    if (reg.disposed || reg.generation !== generation) return;
     renderSidebar(reg, ctx);
-    ctx.ui.notify(`Killed ${jobLabel(target)}`, "info");
+    try {
+        ctx.ui.notify(stopped ? `Killed ${jobLabel(target)}` : `Could not confirm termination of ${jobLabel(target)}`,
+            stopped ? "info" : "error");
+    } catch { /* Session UI may have expired during the kill wait. */ }
 }

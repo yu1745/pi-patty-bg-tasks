@@ -8,15 +8,15 @@
  * tool-call boundary (CC's 'next' priority), or starts a turn when the agent
  * is idle (triggerTurn: true).
  *
- * Exactly-once is enforced by the job's `notified` latch — a check-and-set
- * done BEFORE the send, so any path that already surfaced the outcome (a
+ * Successful delivery is recorded by the job's `notified` latch, so any
+ * path that already surfaced the outcome (a
  * jobs output/attach read, a deliberate kill) suppresses the notification.
  * A terminal job that has been notified is evicted from the live registry;
  * its output log stays on disk and the notification carries the path.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { DELIVER_STEER, EVENT, type Job } from "./types.ts";
+import { DELIVER_STEER, EVENT, isTerminalStatus, type Job } from "./types.ts";
 import type { BackgroundRegistry } from "./state.ts";
 import { forget } from "./registry.ts";
 import { describeJob } from "./format.ts";
@@ -88,12 +88,13 @@ export function markNotified(job: Job): void {
     job.notified = true;
 }
 
+const sending = new WeakSet<Job>();
+const retries = new WeakMap<Job, number>();
+
 /**
- * Send a terminal job's <task-notification>, exactly once. The latch is set
- * BEFORE the send, so a concurrent consumer can never produce a duplicate;
- * if the send itself throws, the notification is lost rather than retried
- * (exactly-once), and the terminal+notified job lingers until the lazy sweep
- * in `jobs list`.
+ * Send a terminal job's notification. Latch only after successful delivery;
+ * an in-flight guard prevents reentrant duplicates. Failed delivery receives
+ * three bounded retries, without waking the process or looping on stale APIs.
  *
  * On success the job is evicted from the live registry (terminal + notified)
  * unless `evict: false` — the monitor path sends before the job is marked
@@ -110,10 +111,14 @@ export function sendTaskNotification(args: {
     /** Explicit summary (monitors compose their own). */
     summary?: string;
     evict?: boolean;
+    /** Internal retry lifetime fence. */
+    generation?: number;
 }): boolean {
     const { reg, pi, job } = args;
-    if (job.notified) return false;
-    job.notified = true;
+    const generation = args.generation ?? reg.generation;
+    if (reg.disposed || generation !== reg.generation) return false;
+    if (job.notified || sending.has(job)) return false;
+    sending.add(job);
     const status = args.status ?? (job.status as TerminalStatus);
     const summary = args.summary ?? completionSummary(job, status);
 
@@ -140,8 +145,18 @@ export function sendTaskNotification(args: {
         );
     } catch (err) {
         console.error("[bg-tasks] task notification failed:", err);
+        const attempt = retries.get(job) ?? 0;
+        if (attempt < 3) {
+            retries.set(job, attempt + 1);
+            const timer = setTimeout(() => sendTaskNotification({ ...args, generation }), 1000 * (attempt + 1));
+            timer.unref();
+        }
         return false;
+    } finally {
+        sending.delete(job);
     }
-    if (args.evict !== false) forget(reg, job);
+    job.notified = true;
+    retries.delete(job);
+    if (args.evict !== false || isTerminalStatus(job.status)) forget(reg, job);
     return true;
 }

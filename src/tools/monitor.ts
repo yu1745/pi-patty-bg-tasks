@@ -94,6 +94,10 @@ export function registerMonitorTool(pi: ExtensionAPI, reg: BackgroundRegistry): 
             if (!p.description || p.description.trim().length === 0) {
                 throw new Error("`description` is required (shown on every notification).");
             }
+            if (p.description.length > 512) throw new Error("`description` must be at most 512 characters.");
+            if (p.persistent !== true && p.timeout_ms !== undefined && (!Number.isFinite(p.timeout_ms) || p.timeout_ms <= 0)) {
+                throw new Error("`timeout_ms` must be a finite positive number.");
+            }
             if (hasWs && !isWsSupported()) {
                 throw new Error(
                     "WebSocket is not available in this runtime (needs Node 22+). " +
@@ -129,6 +133,7 @@ export function registerMonitorTool(pi: ExtensionAPI, reg: BackgroundRegistry): 
                 name: description,
                 command: source.label,
                 pid: source.pid,
+                identity: source.identity,
                 logPath,
                 toolCallId: _toolCallId,
                 kind: "monitor",

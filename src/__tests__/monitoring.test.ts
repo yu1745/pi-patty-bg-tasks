@@ -1,7 +1,7 @@
 import { describe, it, afterEach } from "node:test";
 import { mock } from "node:test";
 import assert from "node:assert/strict";
-import { appendFileSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, rmSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -10,6 +10,7 @@ import {
 } from "../monitoring.ts";
 import {
     EVENT,
+    MAX_LOG_BYTES,
     STALL_CHECK_INTERVAL_MS,
     STALL_THRESHOLD_MS,
 } from "../types.ts";
@@ -117,6 +118,41 @@ void describe("watchStalls — 45s latch (fake timers)", () => {
         // Latched — never fires twice.
         advance(STALL_THRESHOLD_MS * 2);
         assert.equal(sent.length, 1);
+        cancel();
+    });
+
+    void it("retries a failed prompt warning without rereading an unchanged tail", (t) => {
+        mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1_000_000 });
+        t.mock.method(console, "error", () => {});
+        mkdirSync(TMP, { recursive: true });
+        const logPath = join(TMP, "retry-prompt.log");
+        writeFileSync(logPath, "Continue? (y/n)\n");
+        let attempts = 0;
+        const cancel = watchStalls({ jobId: "retry", command: "test", logPath,
+            pi: { sendMessage() { if (++attempts === 1) throw new Error("busy"); } } as never });
+        advance(STALL_THRESHOLD_MS + 2 * STALL_CHECK_INTERVAL_MS);
+        assert.equal(attempts, 2);
+        advance(STALL_THRESHOLD_MS);
+        assert.equal(attempts, 2);
+        cancel();
+    });
+
+    void it("oversize warning retries even when termination cancels the watcher", (t) => {
+        mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1_000_000 });
+        t.mock.method(console, "error", () => {});
+        mkdirSync(TMP, { recursive: true });
+        const logPath = join(TMP, "oversize.log");
+        writeFileSync(logPath, "");
+        truncateSync(logPath, MAX_LOG_BYTES + 1);
+        let attempts = 0;
+        let kills = 0;
+        let cancel!: () => void;
+        cancel = watchStalls({ jobId: "oversize", command: "test", logPath,
+            onOversize() { kills++; cancel(); },
+            pi: { sendMessage() { if (++attempts === 1) throw new Error("busy"); } } as never });
+        advance(3 * STALL_CHECK_INTERVAL_MS);
+        assert.equal(kills, 1);
+        assert.equal(attempts, 2);
         cancel();
     });
 

@@ -20,9 +20,12 @@ interface Msg {
     details?: { terminal?: boolean };
 }
 
-function harness(logPath: string) {
+function harness(logPath: string, failStream = false, resolveOnStop = false) {
     const messages: Msg[] = [];
-    const pi = { sendMessage: (m: Msg) => messages.push(m) };
+    const pi = { sendMessage: (m: Msg) => {
+        if (failStream && m.customType === EVENT.monitorEvent) throw new Error("fake send failure");
+        messages.push(m);
+    } };
     const ctx = {
         ui: { notify() {}, setWidget() {}, setStatus() {}, theme: { fg: (_c: string, t: string) => t } },
     } as unknown as UiContext;
@@ -40,6 +43,7 @@ function harness(logPath: string) {
         exit,
         stop: () => {
             stopped = true;
+            if (resolveOnStop) resolveExit({ code: null, signal: "SIGTERM" });
         },
     };
 
@@ -75,6 +79,46 @@ function harness(logPath: string) {
 }
 
 void describe("monitor-session — lifecycle via a fake source", () => {
+    void it("forced stop reports terminal only when source exit is observed", async () => {
+        const logPath = join(dir, "delayed-stop.log");
+        writeFileSync(logPath, "");
+        const h = harness(logPath, false, false);
+        h.start({ timeoutMs: 1 });
+        await sleep(30);
+        assert.equal(h.isStopped(), true);
+        assert.equal(h.job.status, "running");
+        assert.equal(h.terminals().length, 0);
+        h.resolveExit({ code: null, signal: "SIGTERM" });
+        await sleep(30);
+        assert.equal(h.terminals().length, 1);
+        assert.match(h.allText(), /timeout/);
+        assert.equal(h.job.status, "killed");
+    });
+    void it("stops safely when stream delivery throws", async () => {
+        const logPath = join(dir, "send-failure.log");
+        writeFileSync(logPath, "event\n");
+        const h = harness(logPath, true);
+        h.start();
+        await sleep(300);
+        assert.equal(h.isStopped(), true);
+        assert.equal(h.terminals().length, 0, "wait for source exit before terminal");
+        h.resolveExit({ code: 1, signal: null });
+        await sleep(40);
+        assert.equal(h.terminals().length, 1);
+        assert.match(h.allText(), /delivery failed/);
+    });
+
+    void it("persistent watches ignore the deadline", async () => {
+        const logPath = join(dir, "persistent.log");
+        writeFileSync(logPath, "");
+        const h = harness(logPath);
+        h.start({ persistent: true, timeoutMs: 1 });
+        await sleep(40);
+        assert.equal(h.isStopped(), false);
+        h.resolveExit({ code: 0, signal: null });
+        await sleep(40);
+        assert.equal(h.terminals().length, 1);
+    });
     void it("streams lines and emits exactly one 'stream ended' terminal on clean exit", async () => {
         const logPath = join(dir, "ok.log");
         writeFileSync(logPath, "");
@@ -127,6 +171,9 @@ void describe("monitor-session — lifecycle via a fake source", () => {
         appendFileSync(logPath, Array.from({ length: 600 }, (_, i) => `e${i}`).join("\n") + "\n");
         await sleep(300); // let a follower tick read the burst
 
+        assert.equal(h.terminals().length, 0, "no terminal before observed exit");
+        h.resolveExit({ code: null, signal: "SIGTERM" });
+        await sleep(40);
         assert.equal(h.terminals().length, 1, "exactly one terminal");
         assert.match(h.terminals()[0].content, /too many events/);
         assert.ok(h.isStopped(), "source.stop was called via the kill path");

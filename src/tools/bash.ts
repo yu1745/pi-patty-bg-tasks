@@ -17,10 +17,11 @@ import {
     createBashToolDefinition,
     type BashToolDetails,
 } from "@earendil-works/pi-coding-agent";
-import { unlinkSync } from "node:fs";
+import { statSync, unlinkSync } from "node:fs";
 import type { BackgroundRegistry } from "../state.ts";
 import {
     DEFAULT_TIMEOUT_MS,
+    MAX_LOG_BYTES,
     OUTPUT_PREVIEW_CHARS,
     QUICK_COMPLETION_MS,
     type ForegroundSlot,
@@ -129,6 +130,8 @@ async function runForeground(args: {
 }): Promise<AgentToolResult<BashToolDetails | undefined>> {
     const { toolCallId, command, timeoutMs, signal, onUpdate, ctx, reg, pi } =
         args;
+    const generation = reg.generation;
+    const isActive = () => !reg.disposed && reg.generation === generation;
     const id = newJobId("shell", reg);
     const logPath = logPathFor(id);
 
@@ -141,6 +144,7 @@ async function runForeground(args: {
         command,
         cwd: ctx.cwd,
         logPath,
+        foreground: true,
     });
 
     // Register the foreground slot so Ctrl+Shift+B can find this command.
@@ -164,7 +168,7 @@ async function runForeground(args: {
     // Long-running work is protected the CC way — by auto-backgrounding at the
     // timeout — not by refusing to honor a deliberate cancel.
     const onTurnAbort = () => {
-        if (!pauseRequested) killProcessTree(spawned.pid, "SIGTERM");
+        if (!pauseRequested) killProcessTree(spawned.identity, "SIGTERM");
     };
     if (signal) {
         if (signal.aborted) onTurnAbort();
@@ -178,6 +182,7 @@ async function runForeground(args: {
         id,
         command,
         pid: spawned.pid,
+        identity: spawned.identity,
         logPath,
         toolCallId,
         isBackgrounded: false,
@@ -190,7 +195,9 @@ async function runForeground(args: {
     // steering / Ctrl+Shift+B / auto-bg timeout). Idempotent.
     const promoteToBackground = () => {
         if (handedToBackground) return;
+        if (!isActive()) throw new Error("Session ended before command promotion.");
         handedToBackground = true;
+        spawned.release();
         // Clear the foreground slot now (not only in `finally`) so a backgrounded
         // command can't strand a stale slot when cooperative steering tears down
         // the turn right after requesting the pause.
@@ -202,8 +209,7 @@ async function runForeground(args: {
 
     // Timeout timer.
     const timeoutTimer = setTimeout(() => {
-        if (reg.nonInteractive) return;
-        if (!reg.foreground.has(toolCallId)) return;
+        if (!isActive() || !reg.foreground.has(toolCallId)) return;
         requestPause("timeout");
     }, timeoutMs);
     (timeoutTimer as NodeJS.Timeout).unref();
@@ -211,7 +217,20 @@ async function runForeground(args: {
     let progressPoller: { stop: () => void } | undefined;
     let hintShown = false;
 
+    // Foreground output needs the same disk budget as background output.
+    let outputLimitExceeded = false;
+    const outputGuard = setInterval(() => {
+        try {
+            if (statSync(logPath).size > MAX_LOG_BYTES) {
+                outputLimitExceeded = true;
+                killProcessTree(spawned.identity, "SIGKILL");
+            }
+        } catch { /* spawn/teardown may remove the file */ }
+    }, 200);
+    outputGuard.unref();
+
     const cleanup = () => {
+        clearInterval(outputGuard);
         progressPoller?.stop();
         clearTimeout(timeoutTimer);
         if (signal) signal.removeEventListener("abort", onTurnAbort);
@@ -223,8 +242,12 @@ async function runForeground(args: {
         exit: SpawnExit
     ): AgentToolResult<BashToolDetails | undefined> => {
         const output = readLogTail(job, OUTPUT_PREVIEW_CHARS);
-        // A signal death (e.g. Esc-cancel killed the process group) is a
-        // deliberate cancel, not a command failure — never an error result.
+        if (outputLimitExceeded) throw new Error(`Command exceeded output limit (${MAX_LOG_BYTES} bytes).`);
+        // Only a genuine turn cancellation suppresses signal failure. External
+        // signal death (including OOM/SIGKILL) must remain a failed tool result.
+        if (exit.signal !== null && !signal?.aborted) {
+            throw new Error(`Command terminated by ${exit.signal}${output ? `\n${output}` : ""}`);
+        }
         if (exit.signal === null && exit.code !== 0) {
             throw new Error(output || `Command exited with code ${exit.code ?? 1}`);
         }
@@ -248,8 +271,10 @@ async function runForeground(args: {
         // Still running past the quick window — start progress polling and show
         // the "(ctrl+shift+b to run in background)" hint, like Claude Code.
         progressPoller = streamLog(logPath, onUpdate);
-        showBackgroundHint(ctx);
-        hintShown = true;
+        if (isActive()) {
+            showBackgroundHint(ctx);
+            hintShown = true;
+        }
 
         // Race: completion vs backgrounding.
         const race = await Promise.race<
@@ -276,7 +301,8 @@ async function runForeground(args: {
     } finally {
         // Single teardown for every exit path (return, throw, background hand-off).
         cleanup();
-        if (hintShown) clearBackgroundHint(ctx);
+        spawned.release();
+        if (hintShown) clearBackgroundHint(ctx, isActive());
         reg.foreground.delete(toolCallId);
         if (!handedToBackground) {
             reg.jobs.delete(id);
@@ -310,6 +336,7 @@ function spawnBackground(args: {
         name: args.name,
         command: args.command,
         pid: spawned.pid,
+        identity: spawned.identity,
         logPath,
         toolCallId: args.toolCallId,
     });

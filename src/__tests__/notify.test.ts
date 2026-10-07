@@ -256,7 +256,7 @@ void describe("sendTaskNotification — exactly-once + eviction", () => {
         assert.ok(messages[0].content.includes("<status>completed</status>"));
     });
 
-    void it("a failed send does not retry and does not evict (exactly-once)", () => {
+    void it("a failed send remains unlatched and retryable without eviction", () => {
         const { reg, pi, messages } = harness({ deliverThrows: true });
         const job = mkJob({});
         add(reg, job);
@@ -271,8 +271,10 @@ void describe("sendTaskNotification — exactly-once + eviction", () => {
         }
         assert.equal(sent, false);
         assert.equal(messages.length, 0);
-        assert.equal(job.notified, true, "latch already set — never retried");
+        assert.equal(job.notified, undefined, "failed delivery must remain retryable");
         assert.equal(reg.jobs.has("job-1-1"), true);
+        assert.equal(sendTaskNotification({ reg, pi: harness().pi as never, job }), true);
+        assert.equal(job.notified, true);
     });
 });
 

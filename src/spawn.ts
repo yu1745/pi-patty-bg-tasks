@@ -1,6 +1,7 @@
 // src/spawn.ts
-import { spawn } from "node:child_process";
-import { closeSync, mkdirSync, openSync, unlinkSync } from "node:fs";
+import { spawn, type ChildProcess } from "node:child_process";
+import { closeSync, constants, lstatSync, mkdirSync, openSync, unlinkSync } from "node:fs";
+import { supervisorSource } from "./spawn-supervisor.ts";
 import { dirname } from "node:path";
 
 /** How the child ended: an exit code, or the signal that killed it. Node
@@ -11,10 +12,17 @@ export interface SpawnExit {
     signal: NodeJS.Signals | null;
 }
 
+/** Per-spawn capability, not a PID lookup. Retaining an old capability can
+ * never acquire authority over a later process assigned the same numeric PID. */
+export interface ProcessIdentity { readonly pid: number; }
+
 export interface SpawnResult {
     pid: number;
+    identity: ProcessIdentity;
     logPath: string;
     exit: Promise<SpawnExit>;
+    /** Release the foreground event-loop hold after promotion/cancellation. */
+    release: () => void;
 }
 
 /**
@@ -37,12 +45,15 @@ export function spawnWithFileOutput(args: {
      *  separately (readable, but never emitted as an event). */
     errPath?: string;
     signal?: AbortSignal;
+    foreground?: boolean;
 }): SpawnResult {
     ensureLogDir(args.logPath);
-    const outFd = openSync(args.logPath, "w");
+    const flags = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW;
+    const outFd = openSync(args.logPath, flags, 0o600);
     let errFd: number;
     try {
-        errFd = args.errPath ? openSync(args.errPath, "w") : outFd;
+        if (args.errPath) ensureLogDir(args.errPath);
+        errFd = args.errPath ? openSync(args.errPath, flags, 0o600) : outFd;
     } catch (err) {
         closeSync(outFd);
         throw err;
@@ -54,12 +65,7 @@ export function spawnWithFileOutput(args: {
 
     let proc;
     try {
-        proc = spawn(bin, binArgs, {
-            stdio: ["ignore", outFd, errFd],
-            cwd: args.cwd,
-            detached: true,
-            env: { ...process.env },
-        });
+        proc = spawnSupervisedProcess({ file: bin, fileArgs: binArgs, cwd: args.cwd, stdout: outFd, stderr: errFd });
     } finally {
         closeSync(outFd);
         if (errFd !== outFd) closeSync(errFd);
@@ -74,6 +80,11 @@ export function spawnWithFileOutput(args: {
         // `sleep 30 &`). 'exit' fires when the shell itself exits, returning
         // control immediately. Output still flushes fine — the kernel writes
         // directly to the file fd, no JS drain needed.
+        proc.on("message", (message: unknown) => {
+            const result = message as SpawnExit;
+            if (result && (result.code === null || typeof result.code === "number") &&
+                (result.signal === null || typeof result.signal === "string")) resolve(result);
+        });
         proc.on("exit", (code, signal) => resolve({ code, signal }));
         proc.on("error", () => resolve({ code: 1, signal: null }));
     });
@@ -89,48 +100,117 @@ export function spawnWithFileOutput(args: {
 
     // Kill the process group on abort. Most callers manage abort themselves and
     // do not pass a signal; this is offered for direct/background spawns.
-    const onAbort = () => killProcessTree(pid);
+    const identity = proc.identity!;
+    const onAbort = () => killProcessTree(identity);
     if (args.signal) {
         if (args.signal.aborted) onAbort();
         else args.signal.addEventListener("abort", onAbort, { once: true });
     }
     void exit.finally(() => args.signal?.removeEventListener("abort", onAbort));
 
-    proc.unref();
+    // The IPC channel must not accidentally keep background-only Pi alive.
+    proc.channel?.unref();
+    const release = () => proc.unref();
+    if (!args.foreground) release();
 
-    return { pid, logPath: args.logPath, exit };
+    return { pid, identity, logPath: args.logPath, exit, release };
 }
 
-/** The log dir is a constant (registry.LOG_DIR), so create it once per process
- *  instead of paying a recursive mkdir on every spawn. */
-let logDirCreated = false;
+/** Validate each destination, not a global once flag: stderr and tests may use
+ * different directories. The registry supplies a private, trusted temp root.
+ * O_EXCL/O_NOFOLLOW also prevent replacing/truncating preexisting log files. */
 function ensureLogDir(logPath: string): void {
-    if (logDirCreated) return;
-    mkdirSync(dirname(logPath), { recursive: true });
-    logDirCreated = true;
-}
-
-/**
- * Kill an entire process group via negative PID signal.
- * Falls back to direct PID kill if group kill fails.
- */export function killProcessTree(
-    pid: number | undefined,
-    signal: NodeJS.Signals = "SIGTERM"
-): void {
-    if (typeof pid !== "number" || pid <= 0) return;
-    try {
-        process.kill(-pid, signal);
-    } catch {
-        try {
-            process.kill(pid, signal);
-        } catch {
-            /* already dead */
-        }
+    const dir = dirname(logPath);
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const stat = lstatSync(dir);
+    if (!isSafeLogDirectory(stat)) {
+        throw new Error(`Unsafe log directory: ${dir}`);
     }
 }
 
+/** Windows mode bits are synthesized, not ACL permission evidence. Keep real
+ * directory/symlink checks everywhere; apply Unix owner/mode checks only on POSIX.
+ * Windows inherits the temp parent's ACL; this is not an ACL privacy guarantee. */
+export function isSafeLogDirectory(stat: {
+    isDirectory(): boolean; isSymbolicLink(): boolean; uid: number; mode: number;
+}, platform: NodeJS.Platform = process.platform, uid?: number): boolean {
+    if (!stat.isDirectory() || stat.isSymbolicLink()) return false;
+    if (platform === "win32") return true;
+    const owner = uid ?? process.getuid?.();
+    return (owner === undefined || stat.uid === owner) && !(stat.mode & 0o022);
+}
+
+interface OwnedState { alive: boolean; proc?: ChildProcess; supervised: boolean; }
+// Weak keys avoid PID tombstones and let completed capabilities disappear with
+// their jobs. No numeric PID can recover a capability or revive a dead one.
+const ownedProcesses = new WeakMap<ProcessIdentity, OwnedState>();
+
+/** Shared supervisor for file-backed tasks and bounded pipe-backed monitors.
+ * The supervisor owns the group identity until it has killed descendants. */
+export function spawnSupervisedProcess(args: {
+    file: string;
+    fileArgs: string[];
+    cwd: string;
+    stdout: number | "pipe";
+    stderr: number | "pipe";
+}) {
+    const supervised = process.platform !== "win32";
+    const proc = spawn(supervised ? process.execPath : args.file,
+        supervised ? ["-e", supervisorSource, JSON.stringify([args.file, args.fileArgs])] : args.fileArgs, {
+            stdio: supervised ? ["ignore", args.stdout, args.stderr, "ipc"] : ["ignore", args.stdout, args.stderr],
+            cwd: args.cwd,
+            detached: true,
+            env: { ...process.env },
+        });
+    const identity = retainProcessIdentity(proc, supervised);
+    proc.channel?.unref();
+    return Object.assign(proc, { identity });
+}
+
+/** Capture a child handle once, including direct external children. Call this
+ * while owning the actual ChildProcess, never by looking up a numeric PID. */
+export function retainProcessIdentity(proc: ChildProcess, supervised = false): ProcessIdentity | undefined {
+    if (!proc.pid) return undefined;
+    const identity = Object.freeze({ pid: proc.pid });
+    const state: OwnedState = { alive: proc.exitCode === null && proc.signalCode === null, proc, supervised };
+    ownedProcesses.set(identity, state);
+    const ended = () => { state.alive = false; delete state.proc; };
+    proc.once("exit", ended);
+    proc.once("error", ended);
+    return identity;
+}
+
+/** Liveness is tied to the retained capability, never to a reused PID. */
+export const ownedProcessAlive = (identity: ProcessIdentity): boolean => ownedProcesses.get(identity)?.alive ?? false;
+
+/** Signal only a retained spawn capability. POSIX supervisors signal their own
+ * anchored group over IPC; direct/Windows children use their ChildProcess handle.
+ * Never infer signal authority from a bare PID or fall back to one. */
+export function killProcessTree(
+    target: ProcessIdentity | undefined,
+    signal: NodeJS.Signals = "SIGTERM"
+): void {
+    if (typeof target === "object" && target !== null) {
+        const state = ownedProcesses.get(target);
+        if (!state?.alive || !state.proc) return;
+        try {
+            if (state.supervised) {
+                // IPC addresses the original supervisor, not a numeric PID. It
+                // signals its own anchored group, even if parent exit delivery
+                // is delayed. Never fall back to numeric signalling on failure.
+                if (state.proc.connected) state.proc.send!({ signal }, () => {});
+            } else state.proc.kill(signal);
+        } catch { /* gone/disconnected: no unsafe PID fallback */ }
+        return;
+    }
+    // Bare PID inputs are deliberately rejected, including untyped callers.
+    // There is no safe way to infer which spawn a reused number once denoted.
+}
+
 /** Cheap liveness probe via signal 0. */
-export function processExists(pid: number | undefined): boolean {
+export function processExists(target: ProcessIdentity | number | undefined): boolean {
+    if (typeof target === "object" && target !== null) return ownedProcessAlive(target);
+    const pid = target;
     if (typeof pid !== "number" || pid <= 0) return false;
     try {
         process.kill(pid, 0);

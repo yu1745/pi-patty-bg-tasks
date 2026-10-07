@@ -177,9 +177,9 @@ void describe("jobs.stats", () => {
 void describe("killProcessTree + processExists 안전성", () => {
     void it("잘못된 PID에서 throw하지 않음", () => {
         // 죽은 PID, 음수, 0 모두 무해.
-        killProcessTree(0);
-        killProcessTree(-1);
-        killProcessTree(99999999);
+        killProcessTree(0 as never);
+        killProcessTree(-1 as never);
+        killProcessTree(99999999 as never);
         assert.equal(processExists(99999999), false);
     });
 });

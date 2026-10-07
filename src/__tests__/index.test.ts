@@ -48,6 +48,7 @@ type SessionHandler = (event: { reason?: string }, ctx: unknown) => Promise<void
 function makePi() {
     const tools = new Map<string, CapturedTool>();
     const handlers = new Map<string, SessionHandler>();
+    const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>();
     const messages: { customType: string }[] = [];
     const appendedEntries: unknown[] = [];
     const pi = {
@@ -55,7 +56,7 @@ function makePi() {
             tools.set(def.name, def);
         },
         registerShortcut() {},
-        registerCommand() {},
+        registerCommand(name: string, command: { handler: (args: string, ctx: unknown) => Promise<void> }) { commands.set(name, command); },
         registerMessageRenderer() {},
         on(event: string, handler: SessionHandler) {
             handlers.set(event, handler);
@@ -67,7 +68,7 @@ function makePi() {
             appendedEntries.push(data);
         },
     };
-    return { pi, tools, handlers, messages, appendedEntries };
+    return { pi, tools, handlers, commands, messages, appendedEntries };
 }
 
 const uiCtx = {
@@ -85,6 +86,21 @@ function startExtension() {
     extension(h.pi as never);
     return h;
 }
+
+void it("agent_bg is enabled by default and can be omitted without disabling other tools", () => {
+    const previous = process.env.PI_PATTY_DISABLE_AGENT_BG;
+    try {
+        delete process.env.PI_PATTY_DISABLE_AGENT_BG;
+        assert.ok(startExtension().tools.has("agent_bg"));
+        process.env.PI_PATTY_DISABLE_AGENT_BG = "1";
+        const { tools } = startExtension();
+        assert.equal(tools.has("agent_bg"), false);
+        for (const name of ["bash", "bash_bg", "jobs", "monitor"]) assert.ok(tools.has(name));
+    } finally {
+        if (previous === undefined) delete process.env.PI_PATTY_DISABLE_AGENT_BG;
+        else process.env.PI_PATTY_DISABLE_AGENT_BG = previous;
+    }
+});
 
 void describe("session_start — registry is born empty (no revival)", () => {
     void it("ignores a stale persisted state entry entirely", async () => {
@@ -105,6 +121,22 @@ void describe("session_start — registry is born empty (no revival)", () => {
         assert.equal(res.content[0].text, "No background jobs");
         assert.equal(h.appendedEntries.length, 0, "no state snapshot is written");
     });
+});
+
+void it("a reused extension runtime restores semantic watchdog tracking for the new session", async () => {
+    const h = startExtension();
+    await h.handlers.get("session_start")!({}, {});
+    await h.handlers.get("session_shutdown")!({ reason: "reload" }, {});
+    await h.handlers.get("session_start")!({}, {});
+    const notices: string[] = [];
+    const ctx = { ...uiCtx, ui: { ...uiCtx.ui, notify: (message: string) => { notices.push(message); } } };
+    try {
+        await h.tools.get("bash")!.execute("new-session", { command: "sleep 30", run_in_background: true }, undefined, undefined, ctx);
+        await h.commands.get("stuck-watchdog")!.handler("status", ctx);
+        assert.ok(notices.some(message => message.includes("Tracking 1 job(s)")));
+    } finally {
+        await h.handlers.get("session_shutdown")!({ reason: "quit" }, {});
+    }
 });
 
 void describe("session_shutdown — kills running tasks on ANY reason", () => {
@@ -131,7 +163,7 @@ void describe("session_shutdown — kills running tasks on ANY reason", () => {
 
             const jobs = h.tools.get("jobs")!;
             const list = await jobs.execute("t3", { action: "list" }, undefined, undefined, uiCtx);
-            assert.match(list.content[0].text, /✗ killed/, "task ended up killed");
+            assert.equal(list.content[0].text, "No background jobs", "disposed runtime leaves no phantom jobs");
             assert.equal(liveMarkedProcesses(), 0, "no orphaned process survives");
             assert.equal(
                 h.messages.filter((m) => m.customType === EVENT.taskNotification).length,

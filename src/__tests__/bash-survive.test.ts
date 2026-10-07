@@ -38,7 +38,7 @@ function harness() {
 }
 
 void describe("bash foreground — Claude Code parity on turn abort", () => {
-    const spawnedPids: number[] = [];
+    const spawnedPids: Job["identity"][] = [];
 
     void it("a genuine cancel (Esc) KILLS the foreground command", async () => {
         const { tool, reg, ctx } = harness();
@@ -48,7 +48,7 @@ void describe("bash foreground — Claude Code parity on turn abort", () => {
 
         const job = [...reg.jobs.values()][0] as Job;
         const pid = job.pid;
-        spawnedPids.push(pid);
+        spawnedPids.push(job.identity);
         assert.ok(processExists(pid), "running before the abort");
 
         // No pause was requested → this is a deliberate cancel → CC kills it.
@@ -66,7 +66,7 @@ void describe("bash foreground — Claude Code parity on turn abort", () => {
 
         const job = [...reg.jobs.values()][0] as Job;
         const pid = job.pid;
-        spawnedPids.push(pid);
+        spawnedPids.push(job.identity);
 
         // Cooperative path: a pause is requested (as steering / Ctrl+Shift+B does)
         // BEFORE the abort — CC's 'interrupt'/background path never kills.
