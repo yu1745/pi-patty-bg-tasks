@@ -58,8 +58,10 @@ void describe("input steering (cooperative scheduler)", () => {
         // notice — the user's own resubmitted message drives the next turn,
         // so no redundant agent message is sent.
         assert.equal(sent.length, 0);
+        // Pi 1.0: an aborted run no longer drains the follow-up queue, so the
+        // message is resubmitted as a plain prompt once the turn settles.
         assert.deepEqual(resubmitted, [
-            { text: "stop and inspect the last failure", deliverAs: "followUp" },
+            { text: "stop and inspect the last failure" },
         ]);
     });
 
@@ -89,7 +91,7 @@ void describe("input steering (cooperative scheduler)", () => {
         // resubmitted text), and the second input is ignored (no active slot).
         assert.equal(sent.length, 0);
         assert.equal(abortCalls, 1);
-        assert.deepEqual(resubmitted, [{ text: "first", deliverAs: "followUp" }]);
+        assert.deepEqual(resubmitted, [{ text: "first" }]);
     });
 
     void it("returns continue when no cooperative foreground task is active", async () => {
@@ -144,7 +146,11 @@ function registerAndGetHandler(
             },
             sendUserMessage(content: string | object[], options?: { deliverAs?: string }) {
                 if (typeof content === "string") {
-                    resubmitted.push({ text: content, deliverAs: options?.deliverAs });
+                    resubmitted.push(
+                        options?.deliverAs === undefined
+                            ? { text: content }
+                            : { text: content, deliverAs: options.deliverAs }
+                    );
                 }
             },
         } as never,
@@ -156,8 +162,8 @@ function registerAndGetHandler(
 
 function makeCtx(
     notifications: string[] = [],
-    actions?: { abort(): void }
-): UiContext & { abort(): void } {
+    actions?: { abort(): void; isIdle?(): boolean }
+): UiContext & { abort(): void; isIdle(): boolean } {
     return {
         ui: {
             notify: (message) => notifications.push(message),
@@ -168,5 +174,6 @@ function makeCtx(
             editor: async () => undefined,
         },
         abort: actions?.abort ?? (() => {}),
+        isIdle: actions?.isIdle ?? (() => true),
     };
 }
